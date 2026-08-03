@@ -45,7 +45,7 @@ class _DispatchLog:
             log.info("[Sol-Attn] dense fallback: %s", reason)
 
 
-def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None):
+def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None, thresh_type: str = "diag"):
     dispatch_log = _DispatchLog()
 
     def override(func, q, k, v, heads, *args, **kwargs):
@@ -89,6 +89,7 @@ def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=
                 vt,
                 scale=kwargs.get("scale", None),
                 tau=tau,
+                thresh_type=thresh_type,
             )  # (B, T, H, D)
 
             dispatch_log.hit()
@@ -149,6 +150,15 @@ class SolAttentionPatch:
                         "Enable while validating a new GPU or Triton version.",
                     },
                 ),
+                "thresh_type": (
+                    ["diag", "exact"],
+                    {
+                        "default": "diag",
+                        "tooltip": "Routing threshold estimator. diag is the "
+                        "evaluated default; exact uses second-moment statistics "
+                        "for more precise routing at extra precompute cost.",
+                    },
+                ),
             }
         }
 
@@ -162,7 +172,7 @@ class SolAttentionPatch:
         "your normal backend for any shape it can't handle."
     )
 
-    def patch(self, model, enabled, tau, min_tokens=8192, strict=False):
+    def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag"):
         if not enabled:
             return (model,)
         m = model.clone()
@@ -175,6 +185,7 @@ class SolAttentionPatch:
             int(min_tokens),
             bool(strict),
             fallback_override,
+            thresh_type,
         )
         m.model_options["transformer_options"] = opts
         log.info(

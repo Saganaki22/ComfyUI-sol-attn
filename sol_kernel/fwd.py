@@ -175,15 +175,16 @@ def sol_attn(
     *,
     scale: float | None = None,
     tau: float = 1.0,
+    thresh_type: str = "diag",
 ) -> torch.Tensor:
     """Run the readable Triton reference on BTHD inputs."""
 
-    _validate(q, k, v, 1, "diag")
+    _validate(q, k, v, 1, thresh_type)
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     tau = float(tau)
     batch, tokens, heads, head_dim = q.shape
     blocks = triton.cdiv(tokens, BLOCK)
-    kc, vc, threshold = prepare(q, k, v, scale=scale, tau=tau)
+    kc, vc, threshold = prepare(q, k, v, scale=scale, tau=tau, thresh_type=thresh_type)
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     block_shape = [1, BLOCK, 1, head_dim]
     summary_shape = [1, GROUP, 1, head_dim]

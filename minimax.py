@@ -139,10 +139,13 @@ class _SolLog:
             log.info("[MiniMax H3 Sol] dense fallback: %s", reason)
 
 
-def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict, sol_log):
+def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict, sol_log,
+                                thresh_type="diag", dense_percent=0.0, progress_fn=None):
     """Sol-Attn on the packed NHD views of the fused qkv buffer, no q/k/v copies.
 
-    `tau` may be a float or a zero-argument callable evaluated per call.
+    `tau` may be a float or a zero-argument callable evaluated per call. When
+    `progress_fn` is given, calls earlier than `dense_percent` of the run use
+    the stock dense forward instead.
     """
     heads, head_dim = attn.heads, attn.head_dim
     inner = heads * head_dim
@@ -159,6 +162,8 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
             arch = torch.cuda.get_device_capability(x.device)
             if arch not in SOL_ARCHES:
                 raise _Unsupported(f"unsupported SM{arch[0]}{arch[1]}")
+            if dense_percent > 0.0 and progress_fn is not None and progress_fn() < dense_percent:
+                raise _Unsupported(f"dense first {dense_percent:.0%} of sampling")
 
             q, k, v = attn.qkv_proj(x).split(inner, dim=-1)
             q = q.view(1, s, heads, head_dim)
@@ -176,7 +181,7 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
                 q = attn.q_norm(q)
                 k = attn.k_norm(k)
 
-            out = sol_attn(q, k, v, tau=tau() if callable(tau) else tau)
+            out = sol_attn(q, k, v, tau=tau() if callable(tau) else tau, thresh_type=thresh_type)
             sol_log.hit(s)
             return attn.out_proj(out.view(s, inner))
         except _Unsupported as e:
@@ -214,6 +219,14 @@ class _TauSchedule:
     def weight(self, f):
         if self.curve == "cosine":
             return 0.5 - 0.5 * math.cos(math.pi * f)
+        if self.curve == "sqrt":
+            return math.sqrt(f)
+        if self.curve == "smoothstep":
+            return f * f * (3.0 - 2.0 * f)
+        if self.curve == "exponential":
+            return math.expm1(3.0 * f) / math.expm1(3.0)
+        if self.curve == "step":
+            return 1.0 if f >= 0.5 else 0.0
         return f
 
     def tau(self):
@@ -221,6 +234,13 @@ class _TauSchedule:
             return self.tau_end
         f = min(max(self.t / self.t_max, 0.0), 1.0)
         return self.tau_end + (self.tau_start - self.tau_end) * self.weight(f)
+
+    def progress(self):
+        """Fraction of the run completed: 0 on the first step, 1 at the end."""
+        if self.t is None or not self.t_max:
+            return 1.0
+        f = min(max(self.t / self.t_max, 0.0), 1.0)
+        return 1.0 - f
 
 
 def _make_timestep_tracker(original_forward, schedule):
@@ -236,7 +256,7 @@ def _make_timestep_tracker(original_forward, schedule):
     return forward
 
 
-def _plot_tau_schedule(tau_start, tau_end, curve, width=512, height=320):
+def _plot_tau_schedule(tau_start, tau_end, curve, dense_percent=0.0, width=512, height=320):
     try:
         import matplotlib
 
@@ -251,6 +271,9 @@ def _plot_tau_schedule(tau_start, tau_end, curve, width=512, height=320):
     taus = [tau_end + (tau_start - tau_end) * schedule.weight(1.0 - p) for p in progress]
 
     fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    if dense_percent > 0.0:
+        ax.axvspan(0, dense_percent * 100, color="gray", alpha=0.25, label="dense (stock)")
+        ax.legend(loc="best", fontsize=8)
     ax.plot([p * 100 for p in progress], taus)
     ax.set_xlabel("sampling progress (%)")
     ax.set_ylabel("tau")
@@ -295,10 +318,11 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                     },
                 ),
                 "curve": (
-                    ["linear", "cosine"],
+                    ["linear", "cosine", "sqrt", "smoothstep", "exponential", "step"],
                     {
                         "default": "linear",
-                        "tooltip": "How tau interpolates between tau_start and tau_end.",
+                        "tooltip": "How tau interpolates between tau_start and tau_end "
+                        "across sampling. step switches at the midpoint.",
                     },
                 ),
                 "min_tokens": (
@@ -320,6 +344,27 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                         "Enable while validating a new GPU or Triton version.",
                     },
                 ),
+                "dense_percent": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 0.9,
+                        "step": 0.05,
+                        "tooltip": "Keep the stock dense attention for this fraction "
+                        "of early sampling (the Sol-Attn paper's recipe: 0.2). "
+                        "0 disables the gate.",
+                    },
+                ),
+                "thresh_type": (
+                    ["diag", "exact"],
+                    {
+                        "default": "diag",
+                        "tooltip": "Routing threshold estimator. diag is the "
+                        "evaluated default; exact uses second-moment statistics "
+                        "for more precise routing at extra precompute cost.",
+                    },
+                ),
             }
         }
 
@@ -333,8 +378,8 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         "steps. tau_graph previews the schedule; wire it to a Preview Image node."
     )
 
-    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict):
-        graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve)
+    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type):
+        graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve, float(dense_percent))
         if not enabled:
             return (model, graph)
         if sol_attn is None:
@@ -368,18 +413,21 @@ class MiniMaxH3ScheduledSolAttentionPatch:
             patched.add_object_patch(
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
-                    attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log
+                    attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log,
+                    thresh_type, float(dense_percent), schedule.progress,
                 ),
             )
 
         log.info(
-            "[MiniMax H3 Sol] scheduled tau %.2f -> %.2f (%s) on %d blocks (min_tokens=%d, strict=%s)",
+            "[MiniMax H3 Sol] scheduled tau %.2f -> %.2f (%s) on %d blocks (min_tokens=%d, strict=%s, dense=%.0f%%, thresh=%s)",
             float(tau_start),
             float(tau_end),
             curve,
             len(blocks),
             int(min_tokens),
             bool(strict),
+            100 * float(dense_percent),
+            thresh_type,
         )
         return (patched, graph)
 
@@ -422,6 +470,15 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                         "Enable while validating a new GPU or Triton version.",
                     },
                 ),
+                "thresh_type": (
+                    ["diag", "exact"],
+                    {
+                        "default": "diag",
+                        "tooltip": "Routing threshold estimator. diag is the "
+                        "evaluated default; exact uses second-moment statistics "
+                        "for more precise routing at extra precompute cost.",
+                    },
+                ),
             }
         }
 
@@ -435,7 +492,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         "stock attention forward."
     )
 
-    def patch(self, model, enabled, tau, min_tokens, strict):
+    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type):
         if not enabled:
             return (model,)
         if sol_attn is None:
@@ -460,7 +517,8 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
             patched.add_object_patch(
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
-                    attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log
+                    attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log,
+                    thresh_type,
                 ),
             )
 

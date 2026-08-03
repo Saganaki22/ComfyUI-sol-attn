@@ -2,7 +2,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.1.0**
+**Version: v0.2.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -68,6 +68,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `tau` | FLOAT | `1.0` | Routing threshold in standard deviations above the mean block score. Higher = more KV blocks take the approximate path = faster, lower fidelity. `1.0` is the Sol-Attn default. |
 | `min_tokens` | INT | `8192` | Use the normal backend below this sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
+| `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
 
 **Output:** `model` (`MODEL`)
 
@@ -89,6 +90,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `tau` | FLOAT | `1.0` | Same routing threshold as the generic node. |
 | `min_tokens` | INT | `8192` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
+| `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 
 Only the 30 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. Do **not** stack with KJNodes' MiniMax H3 sage patch — both replace the same `attn.forward` and the later one wins.
 
@@ -107,9 +109,11 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
 | `tau_start` | FLOAT | `2.0` | tau on the first, highest-noise step. |
 | `tau_end` | FLOAT | `0.8` | tau on the final, low-noise steps. |
-| `curve` | COMBO | `linear` | `linear` or `cosine` interpolation between the two. |
+| `curve` | COMBO | `linear` | `linear`, `cosine`, `sqrt`, `smoothstep`, `exponential`, or `step` (hard switch at the midpoint) — how tau interpolates between the two ends. |
 | `min_tokens` | INT | `8192` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
+| `dense_percent` | FLOAT | `0.0` | Keep the stock dense attention for this fraction of early sampling — the Sol-Attn paper's recipe is `0.2`. `0` disables the gate. |
+| `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 
 **Outputs:** `model` (`MODEL`), `tau_graph` (`IMAGE`) — wire to a Preview Image node to see the schedule curve.
 

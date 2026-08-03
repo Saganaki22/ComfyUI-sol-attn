@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.1.0**
+**版本: v0.2.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -68,6 +68,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `tau` | FLOAT | `1.0` | 路由阈值,以块分数均值之上的标准差计。越高 = 越多 KV 块走近似路径 = 更快、保真度更低。`1.0` 为 Sol-Attn 默认值。 |
 | `min_tokens` | INT | `8192` | 低于此序列长度时使用常规后端。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。验证新 GPU 或 Triton 版本时开启。 |
+| `thresh_type` | COMBO | `diag` | `diag`(评估默认值)或 `exact` —— 使用二阶矩统计获得更精确的路由阈值,代价是额外预计算。 |
 
 **输出:** `model`(`MODEL`)
 
@@ -89,6 +90,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `tau` | FLOAT | `1.0` | 与通用节点相同的路由阈值。 |
 | `min_tokens` | INT | `8192` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
+| `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 
 仅修补 30 个主 DiT 块;token refiner 与短序列行为与原版完全一致。**不要**与 KJNodes 的 MiniMax H3 sage 补丁叠加 —— 两者替换同一个 `attn.forward`,后应用者生效。
 
@@ -107,9 +109,11 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
 | `tau_start` | FLOAT | `2.0` | 第一步(噪声最高)时的 tau。 |
 | `tau_end` | FLOAT | `0.8` | 最后几步(低噪声)时的 tau。 |
-| `curve` | COMBO | `linear` | 两者之间的 `linear`(线性)或 `cosine`(余弦)插值。 |
+| `curve` | COMBO | `linear` | `linear`、`cosine`、`sqrt`、`smoothstep`、`exponential` 或 `step`(中点硬切换)—— 两端之间的插值方式。 |
 | `min_tokens` | INT | `8192` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
+| `dense_percent` | FLOAT | `0.0` | 在采样的前此比例内保持原版稠密注意力 —— Sol-Attn 论文的配方为 `0.2`。`0` 表示关闭。 |
+| `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 
 **输出:** `model`(`MODEL`)、`tau_graph`(`IMAGE`)—— 接入 Preview Image 节点即可查看调度曲线。
 
