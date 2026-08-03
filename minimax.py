@@ -140,7 +140,8 @@ class _SolLog:
 
 
 def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict, sol_log,
-                                thresh_type="diag", dense_percent=0.0, progress_fn=None):
+                                thresh_type="diag", dense_percent=0.0, progress_fn=None,
+                                int8_qk=False):
     """Sol-Attn on the packed NHD views of the fused qkv buffer, no q/k/v copies.
 
     `tau` may be a float or a zero-argument callable evaluated per call. When
@@ -181,7 +182,7 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
                 q = attn.q_norm(q)
                 k = attn.k_norm(k)
 
-            out = sol_attn(q, k, v, tau=tau() if callable(tau) else tau, thresh_type=thresh_type)
+            out = sol_attn(q, k, v, tau=tau() if callable(tau) else tau, thresh_type=thresh_type, int8_qk=int8_qk)
             sol_log.hit(s)
             return attn.out_proj(out.view(s, inner))
         except _Unsupported as e:
@@ -365,6 +366,15 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                         "for more precise routing at extra precompute cost.",
                     },
                 ),
+                "int8_qk": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Quantize q/k to int8 for the exact attention "
+                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
+                        "~1% extra numerical error; slightly slower at 8K.",
+                    },
+                ),
             }
         }
 
@@ -378,7 +388,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         "steps. tau_graph previews the schedule; wire it to a Preview Image node."
     )
 
-    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type):
+    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk):
         graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve, float(dense_percent))
         if not enabled:
             return (model, graph)
@@ -414,7 +424,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
                     attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log,
-                    thresh_type, float(dense_percent), schedule.progress,
+                    thresh_type, float(dense_percent), schedule.progress, bool(int8_qk),
                 ),
             )
 
@@ -479,6 +489,15 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                         "for more precise routing at extra precompute cost.",
                     },
                 ),
+                "int8_qk": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Quantize q/k to int8 for the exact attention "
+                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
+                        "~1% extra numerical error; slightly slower at 8K.",
+                    },
+                ),
             }
         }
 
@@ -492,7 +511,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         "stock attention forward."
     )
 
-    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type):
+    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk):
         if not enabled:
             return (model,)
         if sol_attn is None:
@@ -518,7 +537,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
                     attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log,
-                    thresh_type,
+                    thresh_type, int8_qk=bool(int8_qk),
                 ),
             )
 

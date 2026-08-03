@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from .quant import quantize_qk
+
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -451,13 +453,17 @@ def prepare(
     tau: float,
     scale: float,
     thresh_type: str = "diag",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    int8_qk: bool = False,
+) -> tuple:
     kc, vc = _reduce_kv(k, v)
     if thresh_type == "exact":
         threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
     else:
         threshold = _compute_diag_threshold(q, kc, tau=tau, scale=scale)
-    return kc, vc, threshold
+    if not int8_qk:
+        return kc, vc, threshold
+    q8, q_scale, k8, k_scale = quantize_qk(q, k, kc)
+    return kc, vc, threshold, q8, q_scale, k8, k_scale
 
 
 __all__ = ["prepare"]

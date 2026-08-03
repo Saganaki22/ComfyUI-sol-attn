@@ -45,7 +45,7 @@ class _DispatchLog:
             log.info("[Sol-Attn] dense fallback: %s", reason)
 
 
-def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None, thresh_type: str = "diag"):
+def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None, thresh_type: str = "diag", int8_qk: bool = False):
     dispatch_log = _DispatchLog()
 
     def override(func, q, k, v, heads, *args, **kwargs):
@@ -90,6 +90,7 @@ def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=
                 scale=kwargs.get("scale", None),
                 tau=tau,
                 thresh_type=thresh_type,
+                int8_qk=int8_qk,
             )  # (B, T, H, D)
 
             dispatch_log.hit()
@@ -159,6 +160,15 @@ class SolAttentionPatch:
                         "for more precise routing at extra precompute cost.",
                     },
                 ),
+                "int8_qk": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Quantize q/k to int8 for the exact attention "
+                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
+                        "~1% extra numerical error; slightly slower at 8K.",
+                    },
+                ),
             }
         }
 
@@ -172,7 +182,7 @@ class SolAttentionPatch:
         "your normal backend for any shape it can't handle."
     )
 
-    def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag"):
+    def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag", int8_qk=False):
         if not enabled:
             return (model,)
         m = model.clone()
@@ -186,6 +196,7 @@ class SolAttentionPatch:
             bool(strict),
             fallback_override,
             thresh_type,
+            bool(int8_qk),
         )
         m.model_options["transformer_options"] = opts
         log.info(

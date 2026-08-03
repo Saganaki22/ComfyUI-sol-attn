@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.2.0**
+**Version: v0.3.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -76,6 +76,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `min_tokens` | INT | `8192` | Use the normal backend below this sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
 | `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
+| `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. Measured 1.2–1.3× faster above 16K tokens at ~1% extra numerical error; slightly slower at 8K. This is a repository addition, not part of NVIDIA's source. |
 
 **Output:** `model` (`MODEL`)
 
@@ -98,6 +99,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `min_tokens` | INT | `8192` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
+| `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
 
 Only the 30 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. Do **not** stack with KJNodes' MiniMax H3 sage patch — both replace the same `attn.forward` and the later one wins.
 
@@ -121,6 +123,7 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `dense_percent` | FLOAT | `0.0` | Keep the stock dense attention for this fraction of early sampling — the Sol-Attn paper's recipe is `0.2`. `0` disables the gate. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
+| `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
 
 **Outputs:** `model` (`MODEL`), `tau_graph` (`IMAGE`) — wire to a Preview Image node to see the schedule curve.
 
@@ -165,6 +168,7 @@ H3 width (B=1, H=56, D=128, bf16), random tensors, median of 20 iterations after
 - SageAttention is the fair baseline. PyTorch SDPA is shown only because other Sol-Attn plugins quote it — at these sizes it does not use a competitive kernel path.
 - Random Gaussian inputs are the worst case for Sol-Attn's content-dependent routing, so real prompts should meet or beat these ratios; repeated runs vary by a few percent.
 - The generic node's q/k/v copies cost a further 0.2–2 ms per call depending on length ("Sol generic" in the test output).
+- With `int8_qk` enabled (repository addition), the same strided path measures 0.97× at 8,192, 1.30× at 16,384, 1.21× at 32,768, and 1.18× at 65,536 relative to the bf16 numbers above, at ~1% extra numerical error.
 
 Full-model context: one controlled pair (MiniMax H3, 15 s, 480×864, 20 steps, `res_multistep`, fixed seed, same input image) measured Sage 9.91 s/it → Sol 8.92 s/it (−10%) with the hook-based node.
 

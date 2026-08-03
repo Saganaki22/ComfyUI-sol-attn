@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.2.0**
+**版本: v0.3.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -69,6 +69,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `min_tokens` | INT | `8192` | 低于此序列长度时使用常规后端。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。验证新 GPU 或 Triton 版本时开启。 |
 | `thresh_type` | COMBO | `diag` | `diag`(评估默认值)或 `exact` —— 使用二阶矩统计获得更精确的路由阈值,代价是额外预计算。 |
+| `int8_qk` | BOOLEAN | `False` | 将精确注意力路径的 q/k 量化为 int8。实测 16K tokens 以上快 1.2–1.3×,额外数值误差约 1%;8K 时略慢。这是本仓库的新增功能,不属于 NVIDIA 官方源码。 |
 
 **输出:** `model`(`MODEL`)
 
@@ -91,6 +92,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `min_tokens` | INT | `8192` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
+| `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
 
 仅修补 30 个主 DiT 块;token refiner 与短序列行为与原版完全一致。**不要**与 KJNodes 的 MiniMax H3 sage 补丁叠加 —— 两者替换同一个 `attn.forward`,后应用者生效。
 
@@ -114,6 +116,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `dense_percent` | FLOAT | `0.0` | 在采样的前此比例内保持原版稠密注意力 —— Sol-Attn 论文的配方为 `0.2`。`0` 表示关闭。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
+| `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
 
 **输出:** `model`(`MODEL`)、`tau_graph`(`IMAGE`)—— 接入 Preview Image 节点即可查看调度曲线。
 
@@ -158,6 +161,7 @@ H3 尺寸(B=1,H=56,D=128,bf16),随机张量,autotune 热身后取 20 次迭代�
 - SageAttention 是公平基线。列出 PyTorch SDPA 仅因其他 Sol-Attn 插件引用它 —— 在这些尺寸下它并未使用有竞争力的内核路径。
 - 随机高斯输入是 Sol-Attn 内容相关路由的最差情况,真实提示词应达到或超过这些比值;多次运行间存在几个百分点的波动。
 - 通用节点的 q/k/v 拷贝每次调用额外消耗 0.2–2 ms(视长度而定,见测试输出中的 "Sol generic")。
+- 启用 `int8_qk`(本仓库新增)后,同一跨步路径相对上表 bf16 数据的实测比值为:8,192 处 0.97×、16,384 处 1.30×、32,768 处 1.21×、65,536 处 1.18×,额外数值误差约 1%。
 
 全模型参考:一组受控对照(MiniMax H3,15 秒,480×864,20 步,`res_multistep`,固定种子,同一输入图)测得 Sage 9.91 s/it → Sol 8.92 s/it(−10%,使用钩子式节点)。
 
