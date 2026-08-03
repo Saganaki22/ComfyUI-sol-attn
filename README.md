@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.3.0**
+**Version: v0.4.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -19,7 +19,8 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 ## Features
 
 - **Opt-in per-model patching** — only the model you wire through a node is affected; the rest of your graph is untouched.
-- **Two Sol-Attn integration paths** — a generic hook-based node for any model, and a MiniMax H3 node that feeds the kernel strided views of the fused qkv projection with zero q/k/v copies.
+- **Two Sol-Attn integration paths** — a generic hook-based node for any model, and a MiniMax H3 node that feeds the kernel strided views of the fused qkv projection with zero q/k/v copies, plus an exact-KV sink for H3's packed conditioning rows.
+- **SM89 through SM120** — TMA descriptor kernels on SM90/100/120, pointer kernel twins on SM89 (RTX 40-series).
 - **Scheduled sparsity** — ramp `tau` across sampling (sparse early, dense late) with a plotted schedule preview.
 - **Feed-forward chunking** — caps MiniMax H3's MLP peak activation memory, bit-identical output.
 - **Honest fallback** — any shape or GPU the kernel can't handle uses your normal attention backend and logs why; `strict` mode raises instead while validating a new environment.
@@ -27,7 +28,7 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 ## Prerequisites
 
-- NVIDIA GPU: **SM90, SM100, or SM120** (only SM120 is tested by this repository)
+- NVIDIA GPU: **SM89, SM90, SM100, or SM120** — SM90/100/120 run the TMA kernel path; SM89 (RTX 40-series) runs pointer kernel twins. Only SM120 is tested on hardware by this repository; the SM89 path is validated by forced dispatch, not on an SM89 GPU.
 - PyTorch with CUDA, **bfloat16** support
 - **Triton** with `triton.tools.tensor_descriptor` (TMA) — verified on 3.6.0
 - ComfyUI (developed against 0.30.0)
@@ -100,8 +101,9 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
+| `sink_conditioning` | COMBO | `exact_kv` | Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). `exact_kv_and_rows` also runs those query rows dense (~20% cost). `off` disables the sink. |
 
-Only the 30 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. Do **not** stack with KJNodes' MiniMax H3 sage patch — both replace the same `attn.forward` and the later one wins.
+Only the 30 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. It can follow a memory-efficient sage attention patch (e.g. KJNodes' MiniMax H3 one): applied **after** it, this node adopts the sage forward as its fallback, so gated and ineligible steps run mem-efficient sage while eligible steps run Sol-Attn. Applied **before** it, the sage patch shadows this node entirely — order matters.
 
 **Output:** `model` (`MODEL`)
 
@@ -124,6 +126,7 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 | `dense_percent` | FLOAT | `0.0` | Keep the stock dense attention for this fraction of early sampling — the Sol-Attn paper's recipe is `0.2`. `0` disables the gate. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
+| `sink_conditioning` | COMBO | `exact_kv` | Same conditioning-sink choice as node 2. |
 
 **Outputs:** `model` (`MODEL`), `tau_graph` (`IMAGE`) — wire to a Preview Image node to see the schedule curve.
 
@@ -211,9 +214,10 @@ Throughput was neutral in isolation (within noise, ±4%). These numbers are spec
 
 On the environment under "Tested on":
 
-- Strided-view kernel output is **bit-identical** to contiguous input (max abs diff 0).
+- Strided-view kernel output is **bit-identical** to contiguous input (max abs diff 0), including at ragged sequence lengths (8,191 / 12,345 / 38,247 tokens).
 - All-exact mode (`tau=-100`, validation only) matches PyTorch SDPA at relative L2 error `0.00097`.
 - The full patched H3 attention module matches the stock forward at relative L2 error `0.00009`, consistent with bf16 accumulation differences.
+- The SM89 pointer kernel twins are bit-identical to the TMA kernels (bf16 and int8_qk); sink-forced-exact mode matches dense output.
 - Chunked ×2 MLP output matches the full MLP exactly (`assert_close`, rtol=atol=0).
 
 </details>
@@ -237,10 +241,10 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 ## Caveats
 
 - **Sol-Attn is approximate.** Output will not be bit-identical to dense attention; whether that shows in your content is your call — A/B it with `enabled`.
-- **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); these nodes do not implement NVIDIA's model-specific exact text-K/V sink handling, dense first-step/layer scheduling, or any other part of the paper's more conservative recipe.
+- **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); the `sink_conditioning` option implements the paper's exact conditioning-K/V handling, but dense first-layer scheduling and the rest of the paper's more conservative recipe are not implemented.
 - **SM120 support is this repository's change**, not NVIDIA's. NVIDIA's public source gate still names SM90/SM100. Report numerics issues here, not upstream against NVlabs/Sana.
 - **The H3-specific nodes bypass ComfyUI's attention hook.** Other patches attached to `optimized_attention_override` do not run on blocks where Sol is active, and attention `transformer_options` patches are not applied on the Sol path.
-- **The strided-view TMA layout is relaxed in this repository's copy of the validator** and has only been exercised on SM120. Run with `strict=true` once on a new environment.
+- **The strided-view TMA layout is relaxed in this repository's copy of the validator**, exercised on SM120 only and verified at ragged sequence lengths (e.g. 38,247 tokens, real H3 size). The SM89 pointer kernels are validated by forced dispatch on SM120, not on SM89 hardware. Run with `strict=true` once on a new environment.
 - NVIDIA's published ~2.0–2.3× figures are for Sol-Engine as a whole (CuTe kernels, NVFP4, block fusion, datacenter GPUs). This is the Triton reference kernel alone — a different thing entirely.
 - The [KingGore Blackwell fork](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell) was evaluated at H3 width: 4.334 ms for its `flex_attention` path vs 3.256 ms for this Triton reference at 8,192 tokens. It uses a hard block mask (unselected blocks are dropped, not approximated), so it is a different method, and its import-time repair that moves files inside the installed PyTorch package is intentionally excluded here.
 
@@ -274,6 +278,7 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 - **[ComfyUI-RadialAttn](https://github.com/woct0rdho/ComfyUI-RadialAttn)** ([@woct0rdho](https://github.com/woct0rdho)) — established the opt-in `MODEL → MODEL` sparse-attention patch pattern this follows, and maintains the SageAttention Windows builds used as the fallback backend and baseline.
 - **[RadialAttention](https://github.com/mit-han-lab/radial-attention)** (MIT Han Lab) — the sparse attention method that port wraps.
 - **[ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper)** and **[ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)** ([@kijai](https://github.com/kijai)) — parallel prior art for sparse-attention patch nodes; the memory-efficient attention patch pattern the H3 nodes follow comes from KJNodes' `MiniMaxH3MemoryEfficientSageAttentionPatch`.
+- **[ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton)** ([@kijai](https://github.com/kijai)) — kijai's own Triton Sol-Attn node. v0.4.0 adopts patterns proven there: the conditioning exact-KV sink, sigma gating through `transformer_options["sigmas"]`, pointer kernel twins for SM89, and the trimmed autotune lists. Independent implementations of the same kernel; no code is shared.
 - **[Triton](https://github.com/triton-lang/triton)** (OpenAI and contributors) — compiles the kernel.
 - **[SageAttention](https://github.com/thu-ml/SageAttention)** (thu-ml) — the dense baseline every number above is measured against.
 

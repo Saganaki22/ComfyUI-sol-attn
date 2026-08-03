@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.3.0**
+**版本: v0.4.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -16,7 +16,8 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 ## 功能特性
 
 - **按需逐模型打补丁** —— 只有接入节点的模型受影响,工作流其余部分不受影响。
-- **两条 Sol-Attn 集成路径** —— 适用于任意模型的通用钩子节点,以及 MiniMax H3 专用节点:将融合 qkv 投影的跨步视图直接送入内核,零 q/k/v 拷贝。
+- **两条 Sol-Attn 集成路径** —— 适用于任意模型的通用钩子节点,以及 MiniMax H3 专用节点:将融合 qkv 投影的跨步视图直接送入内核,零 q/k/v 拷贝,并为 H3 打包的条件行提供精确 KV 汇聚。
+- **SM89 至 SM120** —— SM90/100/120 使用 TMA 描述符内核,SM89(RTX 40 系列)使用指针内核孪生版本。
 - **调度稀疏** —— 在采样过程中渐变 `tau`(前期稀疏、后期致密),并输出调度曲线预览图。
 - **前馈分块** —— 压低 MiniMax H3 的 MLP 峰值激活显存,输出逐位一致。
 - **诚实回退** —— 内核无法处理的形状或 GPU 自动回退到你原有的注意力后端并记录原因;`strict` 模式则直接抛错,用于验证新环境。
@@ -24,7 +25,7 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 
 ## 前置条件
 
-- NVIDIA GPU:**SM90、SM100 或 SM120**(本仓库仅在 SM120 上测试)
+- NVIDIA GPU:**SM89、SM90、SM100 或 SM120** —— SM90/100/120 运行 TMA 内核路径,SM89(RTX 40 系列)运行指针内核孪生版本。本仓库仅在 SM120 硬件上实测;SM89 路径通过强制分发验证,未在 SM89 GPU 上实测。
 - 支持 CUDA 与 **bfloat16** 的 PyTorch
 - 带有 `triton.tools.tensor_descriptor`(TMA)的 **Triton** —— 已在 3.6.0 上验证
 - ComfyUI(基于 0.30.0 开发)
@@ -93,8 +94,9 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
+| `sink_conditioning` | COMBO | `exact_kv` | 保持 H3 打包的文本/条件/参考/音频 KV 块精确(约 3% 开销,保护提示词遵循与音画同步)。`exact_kv_and_rows` 同时让这些查询行走完全稠密路径(约 20% 开销)。`off` 关闭。 |
 
-仅修补 30 个主 DiT 块;token refiner 与短序列行为与原版完全一致。**不要**与 KJNodes 的 MiniMax H3 sage 补丁叠加 —— 两者替换同一个 `attn.forward`,后应用者生效。
+仅修补 30 个主 DiT 块;token refiner 与短序列行为与原版完全一致。本节点可以接在显存高效 sage 注意力补丁(如 KJNodes 的 MiniMax H3 补丁)**之后**:此时它会将 sage forward 作为回退路径 —— 被门控或不符合条件的步骤运行显存高效 sage,符合条件的步骤运行 Sol-Attn。若顺序相反(本节点在前),sage 补丁会完全覆盖本节点 —— 顺序很重要。
 
 **输出:** `model`(`MODEL`)
 
@@ -117,6 +119,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `dense_percent` | FLOAT | `0.0` | 在采样的前此比例内保持原版稠密注意力 —— Sol-Attn 论文的配方为 `0.2`。`0` 表示关闭。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
+| `sink_conditioning` | COMBO | `exact_kv` | 与节点 2 相同的条件汇聚选择。 |
 
 **输出:** `model`(`MODEL`)、`tau_graph`(`IMAGE`)—— 接入 Preview Image 节点即可查看调度曲线。
 
@@ -204,9 +207,10 @@ H3 尺寸(B=1,H=56,D=128,bf16),随机张量,autotune 热身后取 20 次迭代�
 
 在"测试环境"所列机器上:
 
-- 跨步视图内核输出与连续输入**逐位一致**(最大绝对差 0)。
+- 跨步视图内核输出与连续输入**逐位一致**(最大绝对差 0),包括非整除序列长度(8,191 / 12,345 / 38,247 tokens)。
 - 全精确模式(`tau=-100`,仅用于验证)与 PyTorch SDPA 的相对 L2 误差为 `0.00097`。
 - 完整修补的 H3 注意力模块与原版 forward 的相对 L2 误差为 `0.00009`,符合 bf16 累加差异。
+- SM89 指针内核孪生版本与 TMA 内核逐位一致(bf16 与 int8_qk);强制精确的汇聚模式与稠密输出一致。
 - 分块 ×2 的 MLP 输出与完整 MLP 完全一致(`assert_close`,rtol=atol=0)。
 
 </details>
@@ -230,10 +234,10 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 ## 注意事项
 
 - **Sol-Attn 是近似方法。** 输出不会与稠密注意力逐位一致;是否影响画面由你判断 —— 用 `enabled` 做 A/B。
-- **MiniMax H3 不在 Sol-Attn 论文评估范围内。** H3 使用联合打包序列(文本、条件、音频、视频);本节点包未实现 NVIDIA 论文中更保守配方里的模型专用精确 text-K/V sink 处理、首步/首层稠密调度等内容。
+- **MiniMax H3 不在 Sol-Attn 论文评估范围内。** H3 使用联合打包序列(文本、条件、音频、视频);`sink_conditioning` 选项已实现论文的精确条件 K/V 处理,但首层稠密调度等论文中更保守配方的其余内容未实现。
 - **SM120 支持是本仓库的改动**,而非 NVIDIA 官方。NVIDIA 公开源码的架构门仍只列 SM90/SM100。数值问题请报告到本仓库,不要上报到 NVlabs/Sana。
 - **H3 专用节点绕过了 ComfyUI 的注意力钩子。** 挂在 `optimized_attention_override` 上的其他补丁在 Sol 激活的块上不会运行,注意力相关的 `transformer_options` 补丁也不会在 Sol 路径上应用。
-- **跨步视图 TMA 布局是本仓库在本地验证器副本中放宽的**,目前仅在 SM120 上验证过。在新环境上请先以 `strict=true` 跑一次。
+- **跨步视图 TMA 布局是本仓库在本地验证器副本中放宽的**,仅在 SM120 上实测,并已在非整除序列长度(如 38,247 tokens,真实 H3 尺寸)下验证。SM89 指针内核通过 SM120 上的强制分发验证,未在 SM89 硬件上实测。在新环境上请先以 `strict=true` 跑一次。
 - NVIDIA 公布的约 2.0–2.3× 数据面向整个 Sol-Engine(CuTe 内核、NVFP4、块融合、数据中心 GPU)。本包仅为 Triton 参考内核 —— 完全是另一回事。
 - 已评估 [KingGore Blackwell 分支](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell):其 `flex_attention` 路径在 H3 尺寸、8,192 tokens 下为 4.334 ms,本 Triton 参考为 3.256 ms。它使用硬块掩码(未选中的块被丢弃而非近似),属于不同方法;其导入期修改已安装 PyTorch 包内文件的修复手段在此被有意排除。
 
@@ -267,6 +271,7 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 - **[ComfyUI-RadialAttn](https://github.com/woct0rdho/ComfyUI-RadialAttn)**([@woct0rdho](https://github.com/woct0rdho))—— 确立了本包遵循的按需 `MODEL → MODEL` 稀疏注意力补丁模式;其维护的 SageAttention Windows 构建用作回退后端与基线。
 - **[RadialAttention](https://github.com/mit-han-lab/radial-attention)**(MIT Han Lab)—— 上述移植所包装的稀疏注意力方法。
 - **[ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper)** 与 **[ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)**([@kijai](https://github.com/kijai))—— 稀疏注意力补丁节点的平行先例;H3 节点所遵循的显存高效注意力补丁模式来自 KJNodes 的 `MiniMaxH3MemoryEfficientSageAttentionPatch`。
+- **[ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton)**([@kijai](https://github.com/kijai))—— kijai 自己的 Triton Sol-Attn 节点。v0.4.0 采用了其中验证过的模式:条件精确 KV 汇聚、经 `transformer_options["sigmas"]` 的 sigma 门控、SM89 指针内核孪生版本,以及精简的 autotune 列表。同一内核的独立实现,未共享代码。
 - **[Triton](https://github.com/triton-lang/triton)**(OpenAI 及贡献者)—— 内核的编译器。
 - **[SageAttention](https://github.com/thu-ml/SageAttention)**(thu-ml)—— 以上所有数字的稠密基线。
 

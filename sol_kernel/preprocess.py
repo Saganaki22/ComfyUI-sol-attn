@@ -1,33 +1,30 @@
-"""Block summaries and routing thresholds shared by both CuTe kernels."""
+"""Block summaries and routing thresholds shared by both CuTe kernels.
+
+Loads use plain pointers with explicit strides: TensorDescriptor emulation on
+pre-Hopper arches costs several times more, while on Hopper and newer the
+difference is negligible for these small streaming kernels. The compute-heavy
+forward kernels keep native TMA descriptors on SM90+.
+"""
 
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .quant import quantize_qk
-
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
 THRESHOLD_GROUP_SIZE = 64
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=warps, num_stages=stages)
-        for warps in (4, 8)
-        for stages in (1, 2, 3, 4)
-    ],
-    key=["T"],
-)
 @triton.jit
 def _reduce_kc_kernel(
-    k_desc,
+    k_ptr,
     kc,
     T,
+    s_b, s_t, s_h,
     H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -41,11 +38,14 @@ def _reduce_kc_kernel(
     )
     batch, head = batch_head // H, batch_head % H
     block_len = tl.minimum(BLOCK, T - block * BLOCK)
-    values = k_desc.load(
-        [batch, block * BLOCK, head, d_tile * TILE_D]
-    ).reshape([BLOCK, TILE_D])
-    summary = tl.sum(values, axis=0) / block_len
+    rows = block * BLOCK + tl.arange(0, BLOCK)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
+    values = tl.load(
+        k_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        mask=(rows < T)[:, None] & (offsets < D)[None, :],
+        other=0.0,
+    )
+    summary = tl.sum(values, axis=0) / block_len
     tl.store(
         kc + ((batch * N + block) * H + head) * D + offsets,
         summary,
@@ -53,19 +53,12 @@ def _reduce_kc_kernel(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=warps, num_stages=stages)
-        for warps in (4, 8)
-        for stages in (1, 2, 3, 4)
-    ],
-    key=["T"],
-)
 @triton.jit
 def _reduce_vc_kernel(
-    v_desc,
+    v_ptr,
     vc,
     T,
+    s_b, s_t, s_h,
     H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -78,11 +71,14 @@ def _reduce_vc_kernel(
         tl.program_id(2),
     )
     batch, head = batch_head // H, batch_head % H
-    values = v_desc.load(
-        [batch, block * BLOCK, head, d_tile * TILE_D]
-    ).reshape([BLOCK, TILE_D])
-    summary = tl.sum(values, axis=0)
+    rows = block * BLOCK + tl.arange(0, BLOCK)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
+    values = tl.load(
+        v_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        mask=(rows < T)[:, None] & (offsets < D)[None, :],
+        other=0.0,
+    )
+    summary = tl.sum(values, axis=0)
     tl.store(
         vc + ((batch * N + block) * H + head) * D + offsets,
         summary,
@@ -90,13 +86,9 @@ def _reduce_vc_kernel(
     )
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=4, num_stages=2)],
-    key=["N"],
-)
 @triton.jit
 def _reduce_kc_stats_kernel(
-    kc_desc,
+    kc_ptr,
     kc_mean,
     kc_var_diag,
     H: tl.constexpr,
@@ -107,21 +99,21 @@ def _reduce_kc_stats_kernel(
 ):
     d_tile, batch_head = tl.program_id(0), tl.program_id(1)
     batch, head = batch_head // H, batch_head % H
-    block_offsets = tl.arange(0, GROUP)
-    block_offsets = tl.max_contiguous(block_offsets, GROUP)
+    block_offsets = tl.max_contiguous(tl.arange(0, GROUP), GROUP)
     d_offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     total = tl.zeros((TILE_D,), dtype=tl.float32)
     total_sq = tl.zeros((TILE_D,), dtype=tl.float32)
     count = tl.full((), 0.0, dtype=tl.float32)
     for start in range(0, N, GROUP):
-        valid = start + block_offsets < N
-        values = kc_desc.load(
-            [batch, start, head, d_tile * TILE_D]
-        ).reshape([GROUP, TILE_D]).to(tl.float32)
-        values = tl.where(valid[:, None], values, 0.0)
+        rows = start + block_offsets
+        values = tl.load(
+            kc_ptr + ((batch * N + rows[:, None]) * H + head) * D + d_offsets[None, :],
+            mask=(rows < N)[:, None],
+            other=0.0,
+        ).to(tl.float32)
         total += tl.sum(values, axis=0)
         total_sq += tl.sum(values * values, axis=0)
-        count += tl.sum(valid.to(tl.float32), axis=0)
+        count += tl.sum((rows < N).to(tl.float32), axis=0)
     mean = total / count
     variance = tl.maximum(total_sq / count - mean * mean, 0.0)
     valid_d = d_offsets < D
@@ -137,18 +129,15 @@ def _reduce_kc_stats_kernel(
     )
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=4, num_stages=2)],
-    key=["T"],
-)
 @triton.jit
 def _diag_threshold_kernel(
-    q_desc,
+    q_ptr,
     kc_mean,
     kc_var_diag,
     global_threshold,
     softmax_scale,
     T,
+    s_b, s_t, s_h,
     H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -162,9 +151,12 @@ def _diag_threshold_kernel(
     q_len = tl.minimum(BLOCK, T - q_start).to(tl.float32)
     d_offsets = tl.arange(0, TILE_D)
     valid_d = d_offsets < D
-    q_values = q_desc.load(
-        [batch, q_start, head, 0]
-    ).reshape([BLOCK, TILE_D])
+    rows = q_start + tl.arange(0, BLOCK)
+    q_values = tl.load(
+        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + d_offsets[None, :],
+        mask=(rows < T)[:, None] & valid_d[None, :],
+        other=0.0,
+    )
     q_centroid = tl.sum(q_values.to(tl.float32), axis=0) / q_len
     mean_kc = tl.load(
         kc_mean + batch_head * D + d_offsets,
@@ -190,9 +182,10 @@ def _diag_threshold_kernel(
 
 @triton.jit
 def _pool_query_kernel(
-    q_desc,
+    q_ptr,
     q_bar,
     T,
+    s_b, s_t, s_h,
     H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -204,8 +197,11 @@ def _pool_query_kernel(
     q_start = q_block * BLOCK
     q_len = tl.minimum(BLOCK, T - q_start).to(tl.float32)
     offsets = tl.arange(0, TILE_D)
-    values = q_desc.load([batch, q_start, head, 0]).reshape(
-        [BLOCK, TILE_D]
+    rows = q_start + tl.arange(0, BLOCK)
+    values = tl.load(
+        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        mask=(rows < T)[:, None] & (offsets < D)[None, :],
+        other=0.0,
     )
     centroid = tl.sum(values.to(tl.float32), axis=0) / q_len
     tl.store(
@@ -292,34 +288,30 @@ def _reduce_kv(
         dtype=torch.bfloat16,
     )
     vc = torch.empty_like(kc)
-    k_desc = TensorDescriptor.from_tensor(
-        k,
-        [1, BLOCK_SIZE, 1, tile_d],
-    )
-    v_desc = TensorDescriptor.from_tensor(
-        v,
-        [1, BLOCK_SIZE, 1, tile_d],
-    )
     grid = (triton.cdiv(head_dim, tile_d), blocks, batch * heads)
     _reduce_kc_kernel[grid](
-        k_desc,
+        k,
         kc,
         tokens,
+        k.stride(0), k.stride(1), k.stride(2),
         heads,
         blocks,
         head_dim,
         BLOCK_SIZE,
         tile_d,
+        num_warps=4,
     )
     _reduce_vc_kernel[grid](
-        v_desc,
+        v,
         vc,
         tokens,
+        v.stride(0), v.stride(1), v.stride(2),
         heads,
         blocks,
         head_dim,
         BLOCK_SIZE,
         tile_d,
+        num_warps=4,
     )
     return kc, vc
 
@@ -345,18 +337,8 @@ def _compute_diag_threshold(
         device=q.device,
         dtype=torch.float32,
     )
-    q_desc = TensorDescriptor.from_tensor(
-        q,
-        [1, BLOCK_SIZE, 1, tile_d],
-    )
-    kc_desc = TensorDescriptor.from_tensor(
+    _reduce_kc_stats_kernel[(triton.cdiv(head_dim, tile_d), batch * heads)](
         kc,
-        [1, THRESHOLD_GROUP_SIZE, 1, tile_d],
-    )
-    _reduce_kc_stats_kernel[
-        (triton.cdiv(head_dim, tile_d), batch * heads)
-    ](
-        kc_desc,
         kc_mean,
         kc_var_diag,
         heads,
@@ -364,20 +346,23 @@ def _compute_diag_threshold(
         head_dim,
         tile_d,
         THRESHOLD_GROUP_SIZE,
+        num_warps=4,
     )
     _diag_threshold_kernel[(blocks, batch * heads)](
-        q_desc,
+        q,
         kc_mean,
         kc_var_diag,
         global_threshold,
         scale,
         tokens,
+        q.stride(0), q.stride(1), q.stride(2),
         heads,
         blocks,
         head_dim,
         BLOCK_SIZE,
         tile_d,
         tau,
+        num_warps=4,
     )
     return global_threshold
 
@@ -410,21 +395,17 @@ def _compute_exact_threshold(
         device=q.device,
         dtype=torch.float32,
     )
-    q_desc = TensorDescriptor.from_tensor(
-        q,
-        [1, BLOCK_SIZE, 1, tile_d],
-    )
     _pool_query_kernel[(blocks, batch_heads)](
-        q_desc,
+        q,
         q_bar,
         tokens,
+        q.stride(0), q.stride(1), q.stride(2),
         heads,
         blocks,
         head_dim,
         BLOCK_SIZE,
         tile_d,
         num_warps=4,
-        num_stages=1,
     )
     block_m = 64
     _exact_fused_threshold_kernel[(triton.cdiv(blocks, block_m), batch_heads)](
@@ -440,7 +421,6 @@ def _compute_exact_threshold(
         tile_d,
         tau,
         num_warps=4,
-        num_stages=1,
     )
     return global_threshold
 

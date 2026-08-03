@@ -11,9 +11,12 @@ try:
     import comfy.model_management
     import comfy.quant_ops
 
+    from comfy.ldm.minimax.model import PackedLayout
+
     from .sol_kernel import sol_attn
 except Exception:  # Triton or ComfyUI kitchen ops unavailable; FFN node still loads
     sol_attn = None
+    PackedLayout = None
 
 SOL_ARCHES = {(9, 0), (10, 0), (12, 0)}
 
@@ -141,12 +144,14 @@ class _SolLog:
 
 def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict, sol_log,
                                 thresh_type="diag", dense_percent=0.0, progress_fn=None,
-                                int8_qk=False):
+                                int8_qk=False, sink_conditioning="exact_kv"):
     """Sol-Attn on the packed NHD views of the fused qkv buffer, no q/k/v copies.
 
-    `tau` may be a float or a zero-argument callable evaluated per call. When
-    `progress_fn` is given, calls earlier than `dense_percent` of the run use
-    the stock dense forward instead.
+    `tau` may be a float or a callable of the current sigma. When `progress_fn`
+    is given, calls earlier than `dense_percent` of the run use the stock dense
+    forward instead. `sink_conditioning` forces H3's packed conditioning KV
+    blocks exact ("exact_kv", plus dense conditioning query rows with
+    "exact_kv_and_rows").
     """
     heads, head_dim = attn.heads, attn.head_dim
     inner = heads * head_dim
@@ -163,8 +168,22 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
             arch = torch.cuda.get_device_capability(x.device)
             if arch not in SOL_ARCHES:
                 raise _Unsupported(f"unsupported SM{arch[0]}{arch[1]}")
-            if dense_percent > 0.0 and progress_fn is not None and progress_fn() < dense_percent:
+
+            sigmas = (transformer_options or {}).get("sigmas")
+            sigma = float(sigmas.flatten()[0]) if torch.is_tensor(sigmas) and sigmas.numel() > 0 else None
+            if dense_percent > 0.0 and progress_fn is not None and progress_fn(sigma) < dense_percent:
                 raise _Unsupported(f"dense first {dense_percent:.0%} of sampling")
+
+            sink_blocks = (0, 0)
+            sink_q = (0, 0)
+            if sink_conditioning != "off":
+                span = (transformer_options or {}).get("sol_h3_video_span")
+                if span is not None:
+                    video_start, video_stop = span
+                    if 0 < video_start and s >= video_stop:
+                        sink_blocks = (0, (video_start + 63) // 64)
+                        if sink_conditioning == "exact_kv_and_rows":
+                            sink_q = sink_blocks
 
             q, k, v = attn.qkv_proj(x).split(inner, dim=-1)
             q = q.view(1, s, heads, head_dim)
@@ -182,7 +201,9 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
                 q = attn.q_norm(q)
                 k = attn.k_norm(k)
 
-            out = sol_attn(q, k, v, tau=tau() if callable(tau) else tau, thresh_type=thresh_type, int8_qk=int8_qk)
+            out = sol_attn(q, k, v, tau=tau(sigma) if callable(tau) else tau,
+                           thresh_type=thresh_type, int8_qk=int8_qk,
+                           sink_blocks=sink_blocks, sink_q=sink_q)
             sol_log.hit(s)
             return attn.out_proj(out.view(s, inner))
         except _Unsupported as e:
@@ -198,24 +219,19 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
 
 
 class _TauSchedule:
-    """tau ramp driven by the diffusion timestep.
+    """tau ramp driven by the sampler's current sigma.
 
-    Sigma descends monotonically within a run, so the first model call carries
-    the highest timestep; any increase means a new run started. tau moves from
-    tau_start at the first step to tau_end as sigma approaches zero.
+    ComfyUI publishes the active timestep per model call in
+    transformer_options["sigmas"]; sigma_hi/sigma_lo are the run's endpoints
+    mapped at patch time, so progress is 0 on the first step and 1 on the last.
     """
 
-    def __init__(self, tau_start, tau_end, curve):
+    def __init__(self, tau_start, tau_end, curve, sigma_hi, sigma_lo):
         self.tau_start = float(tau_start)
         self.tau_end = float(tau_end)
         self.curve = curve
-        self.t = None
-        self.t_max = None
-
-    def track(self, t):
-        if self.t is None or t > self.t:
-            self.t_max = t
-        self.t = t
+        self.sigma_hi = float(sigma_hi)
+        self.span = max(float(sigma_hi) - float(sigma_lo), 1e-8)
 
     def weight(self, f):
         if self.curve == "cosine":
@@ -230,31 +246,59 @@ class _TauSchedule:
             return 1.0 if f >= 0.5 else 0.0
         return f
 
-    def tau(self):
-        if self.t is None or not self.t_max:
-            return self.tau_end
-        f = min(max(self.t / self.t_max, 0.0), 1.0)
-        return self.tau_end + (self.tau_start - self.tau_end) * self.weight(f)
-
-    def progress(self):
-        """Fraction of the run completed: 0 on the first step, 1 at the end."""
-        if self.t is None or not self.t_max:
+    def progress(self, sigma):
+        if sigma is None:
             return 1.0
-        f = min(max(self.t / self.t_max, 0.0), 1.0)
-        return 1.0 - f
+        return min(max((self.sigma_hi - sigma) / self.span, 0.0), 1.0)
+
+    def tau(self, sigma):
+        return self.tau_end + (self.tau_start - self.tau_end) * self.weight(1.0 - self.progress(sigma))
 
 
-def _make_timestep_tracker(original_forward, schedule):
-    def forward(*args, **kwargs):
-        timestep = kwargs.get("timestep")
-        if timestep is None and len(args) > 1:
-            timestep = args[1]
-        if torch.is_tensor(timestep) and timestep.numel() > 0:
-            schedule.track(float(timestep.flatten()[0]))
-        return original_forward(*args, **kwargs)
+def _make_span_injector(original_forward):
+    """Publish H3's video segment span into transformer_options for the sink gate.
 
-    forward._minimax_h3_tracker_fallback = original_forward
+    Mirrors MiniMaxH3Model._forward's layout handling: reuse the payload's
+    prebuilt layout when its signature matches, rebuild it the same way
+    otherwise. Adds one small layout construction per model call at most.
+    """
+
+    def forward(x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):
+        if isinstance(transformer_options, dict) and PackedLayout is not None:
+            payload = minimax_payload or {}
+            video_x, audio_x = x[0], x[1]
+            signature = (
+                context.shape[1],
+                video_x.shape[2],
+                -(-video_x.shape[3] // 2) * 2,
+                -(-video_x.shape[4] // 2) * 2,
+                audio_x.shape[-1],
+            )
+            layout = payload.get("layout")
+            try:
+                if layout is None or layout.signature != signature:
+                    layout = PackedLayout(
+                        *signature,
+                        keyframes=payload.get("keyframes"),
+                        refs=payload.get("refs"),
+                        frame_count=payload.get("frame_count"),
+                    )
+                span = next(((a, b) for a, b, kind in layout.segments if kind == "video"), None)
+            except Exception:
+                span = None
+            if span is not None:
+                transformer_options["sol_h3_video_span"] = span
+        return original_forward(x, timestep, context, transformer_options, minimax_payload=minimax_payload, **kwargs)
+
+    forward._minimax_h3_span_fallback = original_forward
     return forward
+
+
+def _install_span_injector(patched):
+    model_forward = patched.get_model_object("diffusion_model._forward")
+    if hasattr(model_forward, "_minimax_h3_span_fallback"):
+        model_forward = model_forward._minimax_h3_span_fallback
+    patched.add_object_patch("diffusion_model._forward", _make_span_injector(model_forward))
 
 
 def _plot_tau_schedule(tau_start, tau_end, curve, dense_percent=0.0, width=512, height=320):
@@ -267,7 +311,7 @@ def _plot_tau_schedule(tau_start, tau_end, curve, dense_percent=0.0, width=512, 
         log.warning("[MiniMax H3 Sol] matplotlib unavailable; tau graph is blank")
         return torch.zeros((1, height, width, 3))
 
-    schedule = _TauSchedule(tau_start, tau_end, curve)
+    schedule = _TauSchedule(tau_start, tau_end, curve, 1.0, 0.0)  # weight() only
     progress = [i / 100 for i in range(101)]
     taus = [tau_end + (tau_start - tau_end) * schedule.weight(1.0 - p) for p in progress]
 
@@ -375,6 +419,16 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                         "~1% extra numerical error; slightly slower at 8K.",
                     },
                 ),
+                "sink_conditioning": (
+                    ["exact_kv", "exact_kv_and_rows", "off"],
+                    {
+                        "default": "exact_kv",
+                        "tooltip": "Keep H3's packed text/conditioning/reference/audio "
+                        "KV blocks exact (~3% cost, protects prompt adherence and "
+                        "audio sync). exact_kv_and_rows also runs those query rows "
+                        "dense (~20% cost). off disables the sink.",
+                    },
+                ),
             }
         }
 
@@ -388,7 +442,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         "steps. tau_graph previews the schedule; wire it to a Preview Image node."
     )
 
-    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk):
+    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, sink_conditioning):
         graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve, float(dense_percent))
         if not enabled:
             return (model, graph)
@@ -405,19 +459,23 @@ class MiniMaxH3ScheduledSolAttentionPatch:
             return (model, graph)
 
         patched = model.clone()
-        schedule = _TauSchedule(tau_start, tau_end, curve)
-        model_forward = patched.get_model_object("diffusion_model.forward")
-        if hasattr(model_forward, "_minimax_h3_tracker_fallback"):
-            model_forward = model_forward._minimax_h3_tracker_fallback
-        patched.add_object_patch(
-            "diffusion_model.forward",
-            _make_timestep_tracker(model_forward, schedule),
+        model_sampling = patched.get_model_object("model_sampling")
+        schedule = _TauSchedule(
+            tau_start,
+            tau_end,
+            curve,
+            float(model_sampling.percent_to_sigma(0.0)),
+            float(model_sampling.percent_to_sigma(1.0)),
         )
+        _install_span_injector(patched)
 
         sol_log = _SolLog()
         for i in range(len(blocks)):
             attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
-            fallback_forward = attn.forward
+            # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
+            # sage patch) as the fallback for gated/ineligible calls
+            prior = getattr(patched, "object_patches", {}).get(f"diffusion_model.blocks.{i}.attn.forward")
+            fallback_forward = prior if prior is not None else attn.forward
             if hasattr(fallback_forward, "_minimax_h3_sol_fallback"):
                 fallback_forward = fallback_forward._minimax_h3_sol_fallback
             patched.add_object_patch(
@@ -425,6 +483,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                 _make_sol_attention_forward(
                     attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log,
                     thresh_type, float(dense_percent), schedule.progress, bool(int8_qk),
+                    sink_conditioning,
                 ),
             )
 
@@ -498,6 +557,16 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                         "~1% extra numerical error; slightly slower at 8K.",
                     },
                 ),
+                "sink_conditioning": (
+                    ["exact_kv", "exact_kv_and_rows", "off"],
+                    {
+                        "default": "exact_kv",
+                        "tooltip": "Keep H3's packed text/conditioning/reference/audio "
+                        "KV blocks exact (~3% cost, protects prompt adherence and "
+                        "audio sync). exact_kv_and_rows also runs those query rows "
+                        "dense (~20% cost). off disables the sink.",
+                    },
+                ),
             }
         }
 
@@ -511,7 +580,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         "stock attention forward."
     )
 
-    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk):
+    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, sink_conditioning):
         if not enabled:
             return (model,)
         if sol_attn is None:
@@ -527,17 +596,21 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
             return (model,)
 
         patched = model.clone()
+        _install_span_injector(patched)
         sol_log = _SolLog()
         for i in range(len(blocks)):
             attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
-            fallback_forward = attn.forward
+            # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
+            # sage patch) as the fallback for gated/ineligible calls
+            prior = getattr(patched, "object_patches", {}).get(f"diffusion_model.blocks.{i}.attn.forward")
+            fallback_forward = prior if prior is not None else attn.forward
             if hasattr(fallback_forward, "_minimax_h3_sol_fallback"):
                 fallback_forward = fallback_forward._minimax_h3_sol_fallback
             patched.add_object_patch(
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
                     attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log,
-                    thresh_type, int8_qk=bool(int8_qk),
+                    thresh_type, int8_qk=bool(int8_qk), sink_conditioning=sink_conditioning,
                 ),
             )
 
