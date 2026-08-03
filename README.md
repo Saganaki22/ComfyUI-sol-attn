@@ -1,5 +1,8 @@
 # ComfyUI-sol-attn
 
+<img width="1117" height="780" alt="Screenshot 2026-08-03 194811" src="https://github.com/user-attachments/assets/8699014f-9351-4c04-b020-5cd9a13accc0" />
+
+
 **English** | **[中文](./README_ZH.md)**
 
 **Version: v0.2.0**
@@ -44,11 +47,14 @@ Restart ComfyUI. There is nothing to pip-install beyond the prerequisites.
 
 ```text
 RTX 5090 (SM120)  ·  torch 2.10.0+cu130  ·  Triton 3.6.0
-Python 3.12.10    ·  ComfyUI 0.30.0      ·  Windows 11
+Python 3.12.10    ·  ComfyUI 0.30.1      ·  Windows 11
 MiniMax H3 (56 heads × 128, bf16, mask=None) — satisfies all kernel constraints
 ```
 
 Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask, 4D q/k/v with contiguous or TMA-compatible strides. Anything else falls back and logs the reason once per cause.
+
+<img width="1589" height="399" alt="Screenshot 2026-08-03 194831" src="https://github.com/user-attachments/assets/38b7b651-03ab-4a04-a5f1-c31fdc02a459" />
+
 
 ## Nodes
 
