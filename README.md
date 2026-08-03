@@ -1,6 +1,6 @@
 # ComfyUI-sol-attn
 
-<img width="1117" height="780" alt="Screenshot 2026-08-03 194811" src="https://github.com/user-attachments/assets/8699014f-9351-4c04-b020-5cd9a13accc0" />
+<img width="1123" height="853" alt="Screenshot 2026-08-03 200716" src="https://github.com/user-attachments/assets/43b7626f-5a9b-48d7-990a-462a5ad13a82" />
 
 
 **English** | **[中文](./README_ZH.md)**
@@ -53,7 +53,8 @@ MiniMax H3 (56 heads × 128, bf16, mask=None) — satisfies all kernel constrain
 
 Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask, 4D q/k/v with contiguous or TMA-compatible strides. Anything else falls back and logs the reason once per cause.
 
-<img width="1589" height="399" alt="Screenshot 2026-08-03 194831" src="https://github.com/user-attachments/assets/38b7b651-03ab-4a04-a5f1-c31fdc02a459" />
+<img width="1430" height="360" alt="Screenshot 2026-08-03 200727" src="https://github.com/user-attachments/assets/cca19a4e-043b-4b6a-b0b6-3af079e54db2" />
+
 
 
 ## Nodes
