@@ -39,7 +39,7 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <this repo>
+git clone https://github.com/Saganaki22/ComfyUI-sol-attn.git
 ```
 
 Restart ComfyUI. There is nothing to pip-install beyond the prerequisites.
