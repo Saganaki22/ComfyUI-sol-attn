@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.4.0**
+**Version: v0.4.7**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -15,6 +15,16 @@
 Sparse attention and memory patches for video diffusion in ComfyUI, built around NVIDIA's **Sol-Attn** Triton reference kernel — running on consumer Blackwell (SM120 / RTX 50-series), which NVIDIA's public dispatcher does not enable. Ships a generic per-model Sol-Attn patch plus three MiniMax H3-specific nodes for copy-free attention, scheduled sparsity, and feed-forward peak-memory reduction.
 
 > Legal note: the kernel in `sol_kernel/` is vendored NVIDIA source (Apache-2.0), modified locally. The SM120 enablement is this repository's change, not NVIDIA's.
+
+## Why this repo
+
+Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-04):
+
+- **Fastest int8 attention at 8K / 16K / 65K tokens** (2.56 / 8.64 / 108.95 ms) and within ~10% at 32K, against kijai's Triton node, KingGore's flex fork, and SageAttention.
+- **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.7× closer than full-key int8 designs (0.030).
+- **Zero-copy by design** — the kernel reads H3's fused qkv views directly; other TMA implementations copy q/k/v first (1.3–2.7 GiB extra peak memory at long lengths, plus the copy time).
+- **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).
+- **More than a kernel** — scheduled tau with graph preview, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), SM89–SM120 support, and honest per-call fallback.
 
 ## Features
 
@@ -151,6 +161,8 @@ Chunking is token-independent math and retains H3's INT8 ConvRot path, whose act
 </details>
 
 ## Benchmarks
+
+Cross-repo comparison table (kijai, KingGore, SageAttention, SDPA): [BENCHMARKS.md](BENCHMARKS.md).
 
 Everything below is one machine (see "Tested on"), one kernel build. Treat it as a smoke test with real numbers attached, not a benchmark suite.
 

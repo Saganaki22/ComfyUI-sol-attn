@@ -201,8 +201,8 @@ def _forward_int8(
     v_desc,
     kc_desc,
     vc_desc,
-    q8_desc,
-    k8_desc,
+    qi_ptr,
+    ki_ptr,
     q_scale,
     k_scale,
     threshold,
@@ -216,14 +216,14 @@ def _forward_int8(
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
-    NB,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
     """INT8 q/k exact path. Routing and the approximate path stay bf16; only the
-    exact-block scores use the int8 dot plus the q*kc mean term, which is the
-    routing-score column already computed for the group."""
+    exact-block residual scores use the int8 dot, with the block-mean term added
+    back from the routing scores already computed for the group. int8 tiles load
+    through pointers (faster than descriptor emulation for 8-bit tiles)."""
     v_tile, q_block, batch_head = (
         tl.program_id(0),
         tl.program_id(1),
@@ -232,12 +232,19 @@ def _forward_int8(
     batch, head = batch_head // H, batch_head % H
     group_offsets = tl.max_contiguous(tl.arange(0, GROUP_SIZE), GROUP_SIZE)
     token_offsets = tl.max_contiguous(tl.arange(0, BLOCK_SIZE), BLOCK_SIZE)
+    d_offsets = tl.arange(0, D)
     q_start = q_block * BLOCK_SIZE
     q = q_desc.load([batch, q_start, head, 0]).reshape([BLOCK_SIZE, D])
-    q8 = q8_desc.load([batch, q_start, head, 0]).reshape([BLOCK_SIZE, D])
+    q_rows = q_start + token_offsets
+    q_valid = q_rows < T
+    q8 = tl.load(
+        qi_ptr + ((batch * T + q_rows[:, None]) * H + head) * D + d_offsets[None, :],
+        mask=q_valid[:, None],
+        other=0,
+    )
     qs = tl.load(
-        q_scale + (batch * T + q_start + token_offsets) * H + head,
-        mask=(q_start + token_offsets) < T,
+        q_scale + (batch * T + q_rows) * H + head,
+        mask=q_valid,
         other=1.0,
     )
     q_len = tl.minimum(BLOCK_SIZE, T - q_start).to(tl.float32)
@@ -300,20 +307,23 @@ def _forward_int8(
                 group_offsets == offset, GROUP_SIZE, exact_offsets
             )
             kv_start = block * BLOCK_SIZE
-            k8 = k8_desc.load(
-                [batch, kv_start, head, 0]
-            ).reshape([BLOCK_SIZE, D])
-            ks = tl.load(k_scale + (batch * NB + block) * H + head)
+            k_rows = kv_start + token_offsets
+            k8 = tl.load(
+                ki_ptr + ((batch * T + k_rows[:, None]) * H + head) * D + d_offsets[None, :],
+                mask=(k_rows < T)[:, None],
+                other=0,
+            )
+            ks = tl.load(k_scale + (batch * T + k_rows) * H + head, mask=k_rows < T, other=1.0)
             s32 = tl.dot(q8, k8.T)
             approx_col = tl.sum(
                 tl.where(group_offsets[None, :] == offset, scores, 0.0), axis=1
             )
             exact_scores = (
-                s32.to(tl.float32) * (qs * ks)[:, None] * scale_log2
+                s32.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
                 + approx_col[:, None]
             )
             exact_scores += tl.where(
-                (kv_start + token_offsets)[None, :] < T,
+                (k_rows < T)[None, :],
                 0.0,
                 -float("inf"),
             )
@@ -501,7 +511,6 @@ def _forward_int8_ptr(
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
-    NB,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -600,13 +609,13 @@ def _forward_int8_ptr(
                 mask=k_valid[:, None],
                 other=0,
             )
-            ks = tl.load(k_scale + (batch * NB + block) * H + head)
+            ks = tl.load(k_scale + (batch * T + k_rows) * H + head, mask=k_valid, other=1.0)
             s32 = tl.dot(qi, ki.T, out_dtype=tl.int32)
             approx_col = tl.sum(
                 tl.where(group_offsets[None, :] == offset, scores, 0.0), axis=1
             )
             exact_scores = (
-                s32.to(tl.float32) * (qs * ks)[:, None] * scale_log2
+                s32.to(tl.float32) * (qs[:, None] * ks[None, :]) * scale_log2
                 + approx_col[:, None]
             )
             exact_scores += tl.where(k_valid[None, :], 0.0, -float("inf"))
@@ -674,7 +683,6 @@ def sol_attn(
                 H=heads,
                 D=head_dim,
                 NT=blocks,
-                NB=blocks,
                 BV=head_dim,
                 BLOCK_SIZE=BLOCK,
                 GROUP_SIZE=GROUP,
@@ -709,8 +717,8 @@ def sol_attn(
             TensorDescriptor.from_tensor(v, block_shape),
             TensorDescriptor.from_tensor(kc, summary_shape),
             TensorDescriptor.from_tensor(vc, summary_shape),
-            TensorDescriptor.from_tensor(q8, block_shape),
-            TensorDescriptor.from_tensor(k8, block_shape),
+            q8,
+            k8,
             q_scale,
             k_scale,
             threshold,
@@ -720,7 +728,6 @@ def sol_attn(
             tokens,
             heads,
             head_dim,
-            blocks,
             blocks,
             head_dim,
             BLOCK,

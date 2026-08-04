@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.4.0**
+**版本: v0.4.7**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -12,6 +12,16 @@
 ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVIDIA 的 **Sol-Attn** Triton 参考内核构建 —— 可在消费级 Blackwell(SM120 / RTX 50 系列)上运行,而 NVIDIA 官方调度器并未启用该架构。包含一个通用的逐模型 Sol-Attn 补丁,以及三个 MiniMax H3 专用节点:零拷贝注意力、调度稀疏和前馈峰值显存削减。
 
 > 法律说明:`sol_kernel/` 中的内核为 NVIDIA 源代码(Apache-2.0)的本地修改副本。SM120 的启用是本仓库的改动,而非 NVIDIA 官方行为。
+
+## 为什么选择本仓库
+
+在 RTX 5090 上与其他 Sol-Attn ComfyUI 实现实测对比(完整表格见 [BENCHMARKS.md](BENCHMARKS.md),2026-08-04):
+
+- **8K / 16K / 65K tokens 下最快的 int8 注意力**(2.56 / 8.64 / 108.95 ms),32K 处差距约 10% 以内 —— 对比 kijai 的 Triton 节点、KingGore 的 flex 分支与 SageAttention。
+- **最佳的 int8 精度** —— 本内核仅量化 K 的块内*残差*,均值项以 bf16 精确保留:相对 L2 误差 0.008,比全键 int8 设计(0.030)接近精确路径约 3.7 倍。
+- **零拷贝设计** —— 内核直接读取 H3 融合 qkv 投影的视图;其他 TMA 实现会先拷贝 q/k/v(长序列下额外增加 1.3–2.7 GiB 峰值显存与拷贝时间)。
+- **数学实现交叉验证** —— 本仓库 bf16 路径与 kijai 的独立实现逐位一致(0.000000),全精确模式与 SDPA 一致(0.00097)。
+- **不止于内核** —— 带曲线预览的调度 tau、条件精确 KV 汇聚、前馈分块(MLP 峰值 −37%)、SM89–SM120 支持,以及诚实的逐调用回退。
 
 ## 功能特性
 
@@ -144,6 +154,8 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 </details>
 
 ## 基准测试
+
+跨仓库对比表(kijai、KingGore、SageAttention、SDPA):[BENCHMARKS.md](BENCHMARKS.md)。
 
 以下数据均来自单台机器(见"测试环境")与单次内核构建。请将其视为附带真实数字的冒烟测试,而非基准测试套件。
 

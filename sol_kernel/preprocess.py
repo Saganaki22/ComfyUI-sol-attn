@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .quant import quantize_qk
+from .quant import quantize_k, quantize_q_with_threshold
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -436,14 +436,24 @@ def prepare(
     int8_qk: bool = False,
 ) -> tuple:
     kc, vc = _reduce_kv(k, v)
+    if not int8_qk:
+        if thresh_type == "exact":
+            threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
+        else:
+            threshold = _compute_diag_threshold(q, kc, tau=tau, scale=scale)
+        return kc, vc, threshold
+
+    # int8 path: quantize the per-block-mean residual of k per token (the mean
+    # term is the routing score the forward computes exactly in bf16), and fuse
+    # the q quantization with the diag threshold so q is read once.
+    ki, ks = quantize_k(k, kc)
+    kv = kc.float().permute(0, 2, 1, 3)  # [B, H, NB, D]
+    stat_mean = kv.mean(dim=2).contiguous()
+    stat_var = (kv - stat_mean.unsqueeze(2)).pow(2).mean(dim=2).contiguous()
+    qi, qs, threshold = quantize_q_with_threshold(q, stat_mean, stat_var, scale=scale, tau=tau)
     if thresh_type == "exact":
         threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
-    else:
-        threshold = _compute_diag_threshold(q, kc, tau=tau, scale=scale)
-    if not int8_qk:
-        return kc, vc, threshold
-    q8, q_scale, k8, k_scale = quantize_qk(q, k, kc)
-    return kc, vc, threshold, q8, q_scale, k8, k_scale
+    return kc, vc, threshold, qi, qs, ki, ks
 
 
 __all__ = ["prepare"]
