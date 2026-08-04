@@ -41,7 +41,7 @@ def _reduce_kc_kernel(
     rows = block * BLOCK + tl.arange(0, BLOCK)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     values = tl.load(
-        k_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        k_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + offsets[None, :],
         mask=(rows < T)[:, None] & (offsets < D)[None, :],
         other=0.0,
     )
@@ -74,7 +74,7 @@ def _reduce_vc_kernel(
     rows = block * BLOCK + tl.arange(0, BLOCK)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     values = tl.load(
-        v_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        v_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + offsets[None, :],
         mask=(rows < T)[:, None] & (offsets < D)[None, :],
         other=0.0,
     )
@@ -153,7 +153,7 @@ def _diag_threshold_kernel(
     valid_d = d_offsets < D
     rows = q_start + tl.arange(0, BLOCK)
     q_values = tl.load(
-        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + d_offsets[None, :],
+        q_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d_offsets[None, :],
         mask=(rows < T)[:, None] & valid_d[None, :],
         other=0.0,
     )
@@ -199,7 +199,7 @@ def _pool_query_kernel(
     offsets = tl.arange(0, TILE_D)
     rows = q_start + tl.arange(0, BLOCK)
     values = tl.load(
-        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + offsets[None, :],
+        q_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + offsets[None, :],
         mask=(rows < T)[:, None] & (offsets < D)[None, :],
         other=0.0,
     )

@@ -35,7 +35,7 @@ def _quantize_k_kernel(
     d = tl.arange(0, D)
     valid = rows < T
     tile = tl.load(
-        k_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + d[None, :],
+        k_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d[None, :],
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -77,7 +77,7 @@ def _q_quant_threshold_kernel(
     valid = rows < T
     q_len = tl.minimum(BLOCK, T - q_block * BLOCK).to(tl.float32)
     tile = tl.load(
-        q_ptr + batch * s_b + rows[:, None] * s_t + head * s_h + d[None, :],
+        q_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d[None, :],
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)

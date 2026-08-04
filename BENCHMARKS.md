@@ -18,7 +18,9 @@ All Sol-Attn implementations are given the **same inputs**: MiniMax H3-shaped st
 | kijai bf16 | 3.76 | 12.20 | 43.32 | 164.90 |
 | kijai int8 | 2.99 | 8.95 | 28.22 | 114.10 |
 | **ours bf16** | 3.81 | 11.98 | 41.73 | 160.35 |
-| **ours int8** | **2.56** | **8.64** | 31.03 | **108.95** |
+| **ours int8** | **2.56** | **8.64** | 31.03 | 118.20¹ |
+
+¹ v0.4.8 measured 118.2 ms at 65,536 (the int64 addressing required for >100K-token strided inputs costs ~7% at this size; smaller sizes are unaffected).
 
 Peak attention memory above resident on the same inputs (our zero-copy path vs the hook-style path that copies q/k/v first — the approach used by the other TMA implementations):
 
@@ -29,7 +31,7 @@ Peak attention memory above resident on the same inputs (our zero-copy path vs t
 | 32,768 | 1,806 | 462 | 1,344 |
 | 65,536 | 3,612 | 924 | 2,688 |
 
-Correctness on the same machine: strided output bit-identical to contiguous input (including ragged lengths 8,191 / 12,345 / 38,247); all-exact mode matches PyTorch SDPA at relative L2 `0.00097`; `int8_qk` matches the bf16 path at `0.0080` and SDPA at `0.0098`. Run-to-run timing variance is a few percent; the 32,768-token int8 row flips between runs.
+Correctness on the same machine: strided output bit-identical to contiguous input (including ragged lengths 8,191 / 12,345 / 38,247 and 103,237 tokens after the v0.4.8 int64-addressing fix); all-exact mode matches PyTorch SDPA at relative L2 `0.00097`; `int8_qk` matches the bf16 path at `0.0080` and SDPA at `0.0098`. Run-to-run timing variance is a few percent; the 32,768-token int8 row flips between runs. Note that **PyTorch SDPA itself overflows int32 strides** on H3's strided qkv views past ~100K tokens — stock attention backends have their own ceiling there.
 
 ## Accuracy (relative L2 error, same random inputs)
 
