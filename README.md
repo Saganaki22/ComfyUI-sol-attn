@@ -64,7 +64,8 @@ MiniMax H3 (56 heads × 128, bf16, mask=None) — satisfies all kernel constrain
 
 Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask, 4D q/k/v with contiguous or TMA-compatible strides. Anything else falls back and logs the reason once per cause.
 
-<img width="1430" height="360" alt="Screenshot 2026-08-03 200727" src="https://github.com/user-attachments/assets/cca19a4e-043b-4b6a-b0b6-3af079e54db2" />
+<img width="1713" height="448" alt="Screenshot 2026-08-05 170148" src="https://github.com/user-attachments/assets/f9accb38-211e-4c02-afda-2f4c59c08b4d" />
+
 
 
 
