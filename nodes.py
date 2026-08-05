@@ -22,7 +22,7 @@ from .sol_kernel import sol_attn
 log = logging.getLogger(__name__)
 
 BLOCK = 64
-SUPPORTED_ARCHES = {(9, 0), (10, 0), (12, 0)}
+SUPPORTED_ARCHES = {(8, 9), (9, 0), (10, 0), (12, 0)}
 
 
 class _Unsupported(Exception):
