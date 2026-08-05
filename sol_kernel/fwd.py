@@ -678,8 +678,12 @@ def sol_attn(
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     sinks = (int(sink_blocks[0]), int(sink_blocks[1]), int(sink_q[0]), int(sink_q[1]))
 
-    if arch[0] < 9:
-        # SM89 pointer path: masked loads, q/k/v keep their strides.
+    # Dispatch by measured speed on SM120: bf16 is faster through the pointer
+    # kernel (up to ~18% at 65K tokens), int8 is faster through TMA. SM90/SM100
+    # keep TMA as the established path; SM89 has no TMA hardware at all.
+    use_ptr = arch[0] < 9 or (arch == (12, 0) and not int8_qk)
+    if use_ptr:
+        # Pointer path: masked loads, q/k/v keep their strides.
         if int8_qk:
             kc, vc, threshold, q8, q_scale, k8, k_scale = prepare(
                 q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True

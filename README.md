@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.5.0**
+**Version: v0.5.1**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -20,7 +20,7 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-05):
 
-- **Within ~3–10% of the fastest Sol kernel** (kijai's Triton node) at every size, with the two bf16 paths bit-identical in output — the remaining difference is what surrounds the kernel.
+- **Speed parity with the fastest Sol kernel** — every measured cell within ~2–4% of kijai's Triton node (autotune-pick territory; cells flip between runs), including the fastest bf16 number at 8K tokens.
 - **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.7× closer than full-key int8 designs (0.030).
 - **Zero-copy by design** — the kernel reads H3's fused qkv views directly; no contiguous copies, 1.3–2.7 GiB lower peak at long lengths.
 - **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).

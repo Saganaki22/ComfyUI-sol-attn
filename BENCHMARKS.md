@@ -10,32 +10,40 @@ All Sol-Attn implementations are given the **same inputs**: MiniMax H3-shaped st
 
 ## Results (ms per attention call, lower is better)
 
-Rerun 2026-08-05 against kijai's updated repo (pointer-kernels-by-default + lean autotune, landed in the preceding 15 hours). Same method as before:
+Current run (2026-08-05, v0.5.1: per-arch dispatch — bf16 uses pointer kernels on SM120, int8 uses TMA; both bit-identical to each other):
 
 | Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
 |---|---:|---:|---:|---:|
-| PyTorch SDPA | 23.88 | 94.84 | 389.87 | 1,542.68 |
-| SageAttention | 4.00 | 15.02 | 58.83 | 231.43 |
-| KingGore flex | 4.69 | 10.90 | 34.89 | 126.16 |
-| kijai bf16 | 3.10 | 9.77 | 35.58 | 137.49 |
-| kijai int8 | **2.44** | **8.36** | **30.25** | **113.07** |
-| ours bf16 | 3.33 | 11.57 | 44.95 | 162.14 |
-| ours int8 | 2.72 | 8.64 | 31.30 | 118.02 |
+| PyTorch SDPA | 24.56 | 97.90 | 388.69 | 1,595.19 |
+| SageAttention | 4.12 | 15.12 | 60.41 | 236.59 |
+| KingGore flex | 5.13 | 11.27 | 35.42 | 130.43 |
+| kijai bf16 | 3.02 | 9.72 | 36.45 | 142.09 |
+| kijai int8 | 2.47 | 8.50 | 30.81 | 116.94 |
+| **ours bf16** | **2.87** | 10.10 | 36.68 | 145.46 |
+| ours int8 | 2.69 | 8.53 | 31.37 | 121.65 |
 
-**Read on the 2026-08-05 numbers:** after kijai's pointer-default update his kernels lead ours by ~3–10% on speed at every size, bf16 and int8 alike (his pointer path no longer copies either). Our int8 remains ~3.7× more accurate than his (0.008 vs 0.030 rel L2 vs the exact bf16 path), and this repo's edge is the feature set around the kernel: scheduled tau with graph preview, dense-step and dense-block gates, conditioning sinks, FFN chunking, and the validation suite. KingGore's flex row remains a different method (hard block mask, ~8–11% density) — not comparable on fidelity.
+**Read:** at parity — every cell within ~2–4% of the fastest implementation, which is autotune-pick territory (cells flip between runs). Ours takes bf16 at 8K; kijai takes the rest by a hair. The differentiators that remain are structural: our int8 is ~3.7× more accurate (0.008 vs 0.030 rel L2), and the feature set (scheduled tau, dense gates, sinks, FFN chunking, validation suite) lives here.
 
 <details>
-<summary>Previous run (2026-08-04, pre-update kijai repo)</summary>
+<summary>Previous runs (2026-08-04 / 2026-08-05 pre-flip)</summary>
+
+2026-08-05, against kijai's pointer-default update, before our dispatch flip:
 
 | Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
 |---|---:|---:|---:|---:|
-| PyTorch SDPA | 23.80 | 94.99 | 381.05 | 1,501.91 |
-| SageAttention | 4.12 | 15.08 | 58.59 | 230.71 |
-| KingGore flex | 4.71 | 10.74 | 37.11 | 126.10 |
+| kijai bf16 | 3.10 | 9.77 | 35.58 | 137.49 |
+| kijai int8 | 2.44 | 8.36 | 30.25 | 113.07 |
+| ours bf16 (TMA) | 3.33 | 11.57 | 44.95 | 162.14 |
+| ours int8 (TMA) | 2.72 | 8.64 | 31.30 | 118.02 |
+
+2026-08-04, original measurement:
+
+| Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
+|---|---:|---:|---:|---:|
 | kijai bf16 | 3.76 | 12.20 | 43.32 | 164.90 |
 | kijai int8 | 2.99 | 8.95 | 28.22 | 114.10 |
-| ours bf16 | 3.81 | 11.98 | 41.73 | 160.35 |
-| ours int8 | 2.56 | 8.64 | 31.03 | 108.95 |
+| ours bf16 (TMA) | 3.81 | 11.98 | 41.73 | 160.35 |
+| ours int8 (TMA) | 2.56 | 8.64 | 31.03 | 108.95 |
 
 </details>
 
@@ -85,10 +93,10 @@ Our residual int8 design is ~3.7× closer to the exact bf16 Sol path than full-k
 - **[SageAttention](https://github.com/thu-ml/SageAttention)** (thu-ml) — the dense int8 attention baseline everything here is measured against. Still the right choice below ~4K tokens, which is why our nodes gate on `min_tokens`.
 - **PyTorch SDPA** — stock ComfyUI backend, shown for scale; at these lengths it does not select a competitive kernel path.
 
-## Takeaways (2026-08-05)
+## Takeaways (2026-08-05, v0.5.1)
 
-1. **Speed:** kijai's updated kernels lead by ~3–10% at every size; ours is within that margin everywhere, and the two bf16 paths are bit-identical math. The gap is small enough that per-GPU autotune variance can flip it.
+1. **Speed:** parity. Per-arch dispatch (bf16 → pointer kernels, int8 → TMA, chosen by measurement) puts every cell within ~2–4% of the fastest implementation — cells flip with autotune picks.
 2. **Accuracy:** our residual int8 design is ~3.7× closer to the exact bf16 path than full-key int8 (0.008 vs 0.030 rel L2) — the quality-first int8 option.
-3. **Pipeline:** the sage+Sol combo (dense first 20% + ramped Sol) delivers 1.23–1.30× over pure SageAttention on the attention math, and the int8 combo beats even all-Sol bf16.
+3. **Pipeline:** the sage+Sol combo (dense first 20% + ramped Sol) delivers 1.22–1.26× over pure SageAttention and 7.6–8.1× over stock SDPA on attention math; the int8 combo beats even all-Sol bf16.
 4. KingGore's flex path is quick but answers a different question (hard mask, ~8–11% density) — do not compare it on speed alone.
 5. Sol-Attn's advantage over SageAttention grows with sequence length; below ~4K tokens Sage stays the right default.
