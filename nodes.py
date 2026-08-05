@@ -135,7 +135,7 @@ class SolAttentionPatch:
                 "min_tokens": (
                     "INT",
                     {
-                        "default": 8192,
+                        "default": 4096,
                         "min": BLOCK * 4,
                         "max": 131072,
                         "step": BLOCK,

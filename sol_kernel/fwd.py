@@ -8,6 +8,51 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .preprocess import prepare
 
 
+def _lean_do_bench(fn, quantiles=None, **kwargs):
+    """do_bench with an L2-sized flush buffer instead of Triton's flat 256 MB.
+
+    The default flush buffer lands on top of the kernel's own peak during the
+    autotune sweep; the device's real L2 is enough to evict between runs.
+    Patched only for the duration of the call.
+    """
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    size = getattr(props, "L2_cache_size", 0) or (32 << 20)
+    buffer = torch.empty(size // 4, dtype=torch.int, device="cuda")
+    driver = triton.runtime.driver.active
+    original = driver.get_empty_cache_for_benchmark
+    driver.get_empty_cache_for_benchmark = lambda: buffer
+    try:
+        return triton.testing.do_bench(fn, quantiles=quantiles, **kwargs)
+    finally:
+        driver.get_empty_cache_for_benchmark = original
+
+
+def _tuned(configs):
+    return triton.autotune(
+        configs=configs,
+        key=["T"],
+        cache_results=True,  # persist timings across restarts, not just per process
+        do_bench=_lean_do_bench,
+    )
+
+
+_TMA_CONFIGS = [
+    # Kept small: every config costs seconds of compile per new T.
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=2),
+    triton.Config({}, num_warps=4, num_stages=3),
+]
+
+_PTR_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=2),
+]
+
+
 def _tma_compatible(t):
     """What TensorDescriptor accepts: dense last dim, 16-byte alignment elsewhere."""
     if t.data_ptr() % 16 != 0 or t.stride(-1) != 1:
@@ -52,17 +97,7 @@ BLOCK = 64
 GROUP = 32
 
 
-@triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({}, num_warps=4, num_stages=1),
-        triton.Config({}, num_warps=8, num_stages=1),
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-    ],
-    key=["T"],
-)
+@_tuned(_TMA_CONFIGS)
 @triton.jit
 def _forward(
     q_desc,
@@ -184,17 +219,7 @@ def _forward(
     )
 
 
-@triton.autotune(
-    configs=[
-        # Kept small: every config costs seconds of compile per new T.
-        triton.Config({}, num_warps=4, num_stages=1),
-        triton.Config({}, num_warps=8, num_stages=1),
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-    ],
-    key=["T"],
-)
+@_tuned(_TMA_CONFIGS)
 @triton.jit
 def _forward_int8(
     q_desc,
@@ -345,14 +370,7 @@ def _forward_int8(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=warps, num_stages=stages)
-        for warps in (4, 8)
-        for stages in (1, 2)
-    ],
-    key=["T"],
-)
+@_tuned(_PTR_CONFIGS)
 @triton.jit
 def _forward_ptr(
     q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, o_ptr,
@@ -489,14 +507,7 @@ def _forward_ptr(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=warps, num_stages=stages)
-        for warps in (4, 8)
-        for stages in (1, 2)
-    ],
-    key=["T"],
-)
+@_tuned(_PTR_CONFIGS)
 @triton.jit
 def _forward_int8_ptr(
     q_ptr, v_ptr, kc_ptr, vc_ptr, qi_ptr, ki_ptr, q_scale, k_scale, threshold, o_ptr,

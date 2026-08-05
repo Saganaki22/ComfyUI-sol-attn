@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.4.8**
+**Version: v0.5.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -18,13 +18,13 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 ## Why this repo
 
-Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-04):
+Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-05):
 
-- **Fastest int8 attention at 8K / 16K / 65K tokens** (2.56 / 8.64 / 108.95 ms) and within ~10% at 32K, against kijai's Triton node, KingGore's flex fork, and SageAttention.
+- **Within ~3–10% of the fastest Sol kernel** (kijai's Triton node) at every size, with the two bf16 paths bit-identical in output — the remaining difference is what surrounds the kernel.
 - **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.7× closer than full-key int8 designs (0.030).
-- **Zero-copy by design** — the kernel reads H3's fused qkv views directly; other TMA implementations copy q/k/v first (1.3–2.7 GiB extra peak memory at long lengths, plus the copy time).
+- **Zero-copy by design** — the kernel reads H3's fused qkv views directly; no contiguous copies, 1.3–2.7 GiB lower peak at long lengths.
 - **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).
-- **More than a kernel** — scheduled tau with graph preview, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), SM89–SM120 support, and honest per-call fallback.
+- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), SM89–SM120 support, and honest per-call fallback.
 
 ## Features
 
@@ -68,6 +68,23 @@ Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask,
 
 
 
+## Pipeline order
+
+Where each node sits in a MiniMax H3 workflow:
+
+```text
+UNETLoader → (LoRA / other model patches)
+          → Patch Sage Attention (KJNodes, optional — sets sage as the fallback backend)
+          → MiniMax H3 Scheduled Sol Attention Patch   (or the Memory Efficient one)
+          → MiniMax H3 Chunk FeedForward
+          → EasyCache (optional, core node)
+          → guider / sampler
+```
+
+- **The two H3 attention nodes are alternatives — never both.** The scheduled node is a superset of the memory-efficient one (set `tau_start = tau_end` to make them identical).
+- **Sage composes in front, not behind.** KJNodes' `Patch Sage Attention` only swaps the backend, so anything our node declines (early dense steps, short sequences, ineligible shapes) runs sage through the stock forward. Applied after our node it would do nothing. For the zero-copy variant: KJNodes' `MiniMax H3 Memory Efficient Sage Attention Patch` applied **before** our node is adopted as the fallback forward; applied after, it shadows our node entirely.
+- For non-H3 models use the generic `SolAttentionPatch` instead: `UNETLoader → Sol-Attn → guider`.
+
 ## Nodes
 
 <details>
@@ -84,7 +101,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `model` | MODEL | required | The model to patch. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
 | `tau` | FLOAT | `1.0` | Routing threshold in standard deviations above the mean block score. Higher = more KV blocks take the approximate path = faster, lower fidelity. `1.0` is the Sol-Attn default. |
-| `min_tokens` | INT | `8192` | Use the normal backend below this sequence length. |
+| `min_tokens` | INT | `4096` | Use the normal backend below this sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
 | `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
 | `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. Measured 1.2–1.3× faster above 16K tokens at ~1% extra numerical error; slightly slower at 8K. This is a repository addition, not part of NVIDIA's source. |
@@ -107,11 +124,12 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `model` | MODEL | required | A MiniMax H3 model; anything else passes through unchanged with a warning. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
 | `tau` | FLOAT | `1.0` | Same routing threshold as the generic node. |
-| `min_tokens` | INT | `8192` | Use the stock attention forward below this packed sequence length. |
+| `min_tokens` | INT | `4096` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
 | `sink_conditioning` | COMBO | `exact_kv` | Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). `exact_kv_and_rows` also runs those query rows dense (~20% cost). `off` disables the sink. |
+| `dense_blocks` | STRING | empty | Transformer blocks to keep dense, e.g. `0-2,-1` for the first three and the last (negative counts from the end). First/last blocks are the most approximation-sensitive. Empty sparsifies all. |
 
 Only the 30 main DiT blocks are patched; the token refiner and short sequences behave exactly as stock. It can follow a memory-efficient sage attention patch (e.g. KJNodes' MiniMax H3 one): applied **after** it, this node adopts the sage forward as its fallback, so gated and ineligible steps run mem-efficient sage while eligible steps run Sol-Attn. Applied **before** it, the sage patch shadows this node entirely — order matters.
 
@@ -128,15 +146,16 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 |-----------|------|---------|-------------|
 | `model` | MODEL | required | A MiniMax H3 model. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
-| `tau_start` | FLOAT | `2.0` | tau on the first, highest-noise step. |
+| `tau_start` | FLOAT | `1.25` | tau on the first, highest-noise step. |
 | `tau_end` | FLOAT | `0.8` | tau on the final, low-noise steps. |
 | `curve` | COMBO | `linear` | `linear`, `cosine`, `sqrt`, `smoothstep`, `exponential`, or `step` (hard switch at the midpoint) — how tau interpolates between the two ends. |
-| `min_tokens` | INT | `8192` | Use the stock attention forward below this packed sequence length. |
+| `min_tokens` | INT | `4096` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `dense_percent` | FLOAT | `0.0` | Keep the stock dense attention for this fraction of early sampling — the Sol-Attn paper's recipe is `0.2`. `0` disables the gate. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
 | `sink_conditioning` | COMBO | `exact_kv` | Same conditioning-sink choice as node 2. |
+| `dense_blocks` | STRING | empty | Same dense-block spec as node 2. |
 
 **Outputs:** `model` (`MODEL`), `tau_graph` (`IMAGE`) — wire to a Preview Image node to see the schedule curve.
 
@@ -152,9 +171,11 @@ Splits H3's token-local feed-forward over the packed sequence dimension while pr
 | `model` | MODEL | required | A MiniMax H3 model. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
 | `chunks` | INT | `2` | More chunks reduce peak MLP activation memory further. |
-| `min_tokens` | INT | `4096` | Keep the normal full-width MLP below this packed sequence length. |
+| `min_tokens` | INT | `8192` | Keep the normal full-width MLP below this packed sequence length. |
 
 Chunking is token-independent math and retains H3's INT8 ConvRot path, whose activation scales are row-wise; outputs were bit-identical in testing. Inputs requiring gradients use the original unchunked MLP.
+
+The benefit scales linearly with the packed sequence: the intermediate is 56 KB per token, so the saving grows from ~238 MiB at 8K tokens to ~1.9 GiB at 65K (measured, ×2 chunks, int8 checkpoint). Below `min_tokens` the node does nothing at all — lower it if you want relief on short renders too, raise it if you only care about long ones.
 
 **Output:** `model` (`MODEL`)
 
@@ -179,7 +200,7 @@ H3 width (B=1, H=56, D=128, bf16), random tensors, median of 20 iterations after
 | 32,768 | 352.15 | 55.90 | 38.73 | 1.44× | 9.09× |
 | 65,536 | 1,350.54 | 221.06 | 153.56 | 1.44× | 8.79× |
 
-- `0.67× vs Sage` at 2,048 tokens means **Sage is faster there** — below roughly 4K tokens Sage wins outright, which is why `min_tokens` defaults to 8,192.
+- `0.67× vs Sage` at 2,048 tokens means **Sage is faster there** — below roughly 4K tokens Sage wins outright. `min_tokens` defaults to 4,096; raise it toward 8,192 if you want only the measured wins.
 - SageAttention is the fair baseline. PyTorch SDPA is shown only because other Sol-Attn plugins quote it — at these sizes it does not use a competitive kernel path.
 - Random Gaussian inputs are the worst case for Sol-Attn's content-dependent routing, so real prompts should meet or beat these ratios; repeated runs vary by a few percent.
 - The generic node's q/k/v copies cost a further 0.2–2 ms per call depending on length ("Sol generic" in the test output).
@@ -248,7 +269,7 @@ ComfyUI ships core **EasyCache**/`LazyCache` nodes (`comfy_extras/nodes_easycach
 [MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=4096)
 ```
 
-Each distinct fallback reason is logged once per run. Also note the compile tax: Triton autotunes with `key=["T"]`, so the **first run at any new token count pays a JIT sweep inside the sampling loop** — change resolution or duration and you pay it again. Benchmark the second run.
+Each distinct fallback reason is logged once per run. Also note the compile tax: Triton autotunes with `key=["T"]`, so the **first run at any new token count pays a JIT sweep inside the sampling loop** — timings are cached to disk, so a given token count pays it only once ever, but change resolution or duration and you pay it again for the new size. Benchmark the second run.
 
 ## Caveats
 

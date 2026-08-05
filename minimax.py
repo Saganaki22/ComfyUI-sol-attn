@@ -2,6 +2,7 @@
 
 import logging
 import math
+import re
 
 import torch
 
@@ -69,7 +70,7 @@ class MiniMaxH3ChunkFeedForward:
                 "min_tokens": (
                     "INT",
                     {
-                        "default": 4096,
+                        "default": 8192,
                         "min": 256,
                         "max": 131072,
                         "step": 256,
@@ -301,6 +302,25 @@ def _install_span_injector(patched):
     patched.add_object_patch("diffusion_model._forward", _make_span_injector(model_forward))
 
 
+def _parse_dense_blocks(spec, count):
+    """Parse "0-3,47,-1" into absolute block indices; negatives count from the end."""
+    out = set()
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        match = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
+        if match is None:
+            raise ValueError(f"cannot parse dense_blocks entry {part!r}; use indices and ranges like '0-3,47,-1'")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        first = first if first >= 0 else count + first
+        last = last if last >= 0 else count + last
+        if first > last:
+            first, last = last, first
+        out.update(range(max(first, 0), min(last, count - 1) + 1))
+    return out
+
+
 def _plot_tau_schedule(tau_start, tau_end, curve, dense_percent=0.0, width=512, height=320):
     try:
         import matplotlib
@@ -343,7 +363,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                 "tau_start": (
                     "FLOAT",
                     {
-                        "default": 2.0,
+                        "default": 1.25,
                         "min": 0.0,
                         "max": 4.0,
                         "step": 0.05,
@@ -373,7 +393,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                 "min_tokens": (
                     "INT",
                     {
-                        "default": 8192,
+                        "default": 4096,
                         "min": 256,
                         "max": 131072,
                         "step": 256,
@@ -429,6 +449,16 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                         "dense (~20% cost). off disables the sink.",
                     },
                 ),
+                "dense_blocks": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Transformer blocks to keep dense, e.g. '0-2,-1' "
+                        "for the first three and the last. Negative indices count "
+                        "from the end. First and last blocks are the most "
+                        "approximation-sensitive. Empty sparsifies all.",
+                    },
+                ),
             }
         }
 
@@ -442,7 +472,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         "steps. tau_graph previews the schedule; wire it to a Preview Image node."
     )
 
-    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, sink_conditioning):
+    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, sink_conditioning, dense_blocks):
         graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve, float(dense_percent))
         if not enabled:
             return (model, graph)
@@ -470,7 +500,10 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         _install_span_injector(patched)
 
         sol_log = _SolLog()
+        dense = _parse_dense_blocks(dense_blocks, len(blocks))
         for i in range(len(blocks)):
+            if i in dense:
+                continue
             attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
             # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
             # sage patch) as the fallback for gated/ineligible calls
@@ -488,10 +521,11 @@ class MiniMaxH3ScheduledSolAttentionPatch:
             )
 
         log.info(
-            "[MiniMax H3 Sol] scheduled tau %.2f -> %.2f (%s) on %d blocks (min_tokens=%d, strict=%s, dense=%.0f%%, thresh=%s)",
+            "[MiniMax H3 Sol] scheduled tau %.2f -> %.2f (%s) on %d of %d blocks (min_tokens=%d, strict=%s, dense=%.0f%%, thresh=%s)",
             float(tau_start),
             float(tau_end),
             curve,
+            len(blocks) - len(dense),
             len(blocks),
             int(min_tokens),
             bool(strict),
@@ -523,7 +557,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                 "min_tokens": (
                     "INT",
                     {
-                        "default": 8192,
+                        "default": 4096,
                         "min": 256,
                         "max": 131072,
                         "step": 256,
@@ -567,6 +601,16 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                         "dense (~20% cost). off disables the sink.",
                     },
                 ),
+                "dense_blocks": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Transformer blocks to keep dense, e.g. '0-2,-1' "
+                        "for the first three and the last. Negative indices count "
+                        "from the end. First and last blocks are the most "
+                        "approximation-sensitive. Empty sparsifies all.",
+                    },
+                ),
             }
         }
 
@@ -580,7 +624,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         "stock attention forward."
     )
 
-    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, sink_conditioning):
+    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, sink_conditioning, dense_blocks):
         if not enabled:
             return (model,)
         if sol_attn is None:
@@ -598,7 +642,10 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         patched = model.clone()
         _install_span_injector(patched)
         sol_log = _SolLog()
+        dense = _parse_dense_blocks(dense_blocks, len(blocks))
         for i in range(len(blocks)):
+            if i in dense:
+                continue
             attn = patched.get_model_object(f"diffusion_model.blocks.{i}.attn")
             # adopt an earlier node's attn.forward patch (e.g. a memory-efficient
             # sage patch) as the fallback for gated/ineligible calls
@@ -615,7 +662,8 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
             )
 
         log.info(
-            "[MiniMax H3 Sol] patched %d attention blocks (tau=%.2f, min_tokens=%d, strict=%s)",
+            "[MiniMax H3 Sol] patched %d of %d attention blocks (tau=%.2f, min_tokens=%d, strict=%s)",
+            len(blocks) - len(dense),
             len(blocks),
             float(tau),
             int(min_tokens),

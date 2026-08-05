@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.4.8**
+**版本: v0.5.0**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -61,6 +61,23 @@ MiniMax H3(56 头 × 128,bf16,mask=None)—— 满足全部内核约束
 
 Sol-Attn 运行时约束:`head_dim` 必须恰好为 128、bf16、无注意力掩码、4D q/k/v 且为连续或 TMA 兼容跨步布局。不满足时将回退,并按原因各记录一次日志。
 
+## 节点接入顺序
+
+在 MiniMax H3 工作流中的位置:
+
+```text
+UNETLoader → (LoRA / 其他模型补丁)
+          → Patch Sage Attention(KJNodes,可选 —— 将 sage 设为回退后端)
+          → MiniMax H3 Scheduled Sol Attention Patch(或 Memory Efficient 版)
+          → MiniMax H3 Chunk FeedForward
+          → EasyCache(可选,核心节点)
+          → guider / sampler
+```
+
+- **两个 H3 注意力节点二选一,切勿同时使用。** 调度节点是显存高效节点的超集(`tau_start = tau_end` 时两者完全等价)。
+- **sage 只能接在前,不能接在后。** KJNodes 的 `Patch Sage Attention` 只是切换后端,因此本节点拒绝处理的步骤(早期稠密步、短序列、不合规形状)会经原版 forward 落到 sage。若放在本节点之后则不起作用。零拷贝变体的用法:将 KJNodes 的 `MiniMax H3 Memory Efficient Sage Attention Patch` 放在本节点**之前**,它会被采纳为回退 forward;放在之后则会完全覆盖本节点。
+- 非 H3 模型请改用通用的 `SolAttentionPatch`:`UNETLoader → Sol-Attn → guider`。
+
 ## 节点
 
 <details>
@@ -77,7 +94,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `model` | MODEL | 必填 | 要打补丁的模型。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
 | `tau` | FLOAT | `1.0` | 路由阈值,以块分数均值之上的标准差计。越高 = 越多 KV 块走近似路径 = 更快、保真度更低。`1.0` 为 Sol-Attn 默认值。 |
-| `min_tokens` | INT | `8192` | 低于此序列长度时使用常规后端。 |
+| `min_tokens` | INT | `4096` | 低于此序列长度时使用常规后端。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。验证新 GPU 或 Triton 版本时开启。 |
 | `thresh_type` | COMBO | `diag` | `diag`(评估默认值)或 `exact` —— 使用二阶矩统计获得更精确的路由阈值,代价是额外预计算。 |
 | `int8_qk` | BOOLEAN | `False` | 将精确注意力路径的 q/k 量化为 int8。实测 16K tokens 以上快 1.2–1.3×,额外数值误差约 1%;8K 时略慢。这是本仓库的新增功能,不属于 NVIDIA 官方源码。 |
@@ -100,11 +117,12 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `model` | MODEL | 必填 | MiniMax H3 模型;其他模型将警告并原样返回。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
 | `tau` | FLOAT | `1.0` | 与通用节点相同的路由阈值。 |
-| `min_tokens` | INT | `8192` | 低于此打包序列长度时使用原版注意力 forward。 |
+| `min_tokens` | INT | `4096` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
 | `sink_conditioning` | COMBO | `exact_kv` | 保持 H3 打包的文本/条件/参考/音频 KV 块精确(约 3% 开销,保护提示词遵循与音画同步)。`exact_kv_and_rows` 同时让这些查询行走完全稠密路径(约 20% 开销)。`off` 关闭。 |
+| `dense_blocks` | STRING | 空 | 保持稠密的 Transformer 块,如 `0-2,-1` 表示前三个与最后一个(负数从末尾计数)。首尾块对近似误差最敏感。留空则全部稀疏化。 |
 
 仅修补 30 个主 DiT 块;token refiner 与短序列行为与原版完全一致。本节点可以接在显存高效 sage 注意力补丁(如 KJNodes 的 MiniMax H3 补丁)**之后**:此时它会将 sage forward 作为回退路径 —— 被门控或不符合条件的步骤运行显存高效 sage,符合条件的步骤运行 Sol-Attn。若顺序相反(本节点在前),sage 补丁会完全覆盖本节点 —— 顺序很重要。
 
@@ -121,15 +139,16 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | 必填 | MiniMax H3 模型。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
-| `tau_start` | FLOAT | `2.0` | 第一步(噪声最高)时的 tau。 |
+| `tau_start` | FLOAT | `1.25` | 第一步(噪声最高)时的 tau。 |
 | `tau_end` | FLOAT | `0.8` | 最后几步(低噪声)时的 tau。 |
 | `curve` | COMBO | `linear` | `linear`、`cosine`、`sqrt`、`smoothstep`、`exponential` 或 `step`(中点硬切换)—— 两端之间的插值方式。 |
-| `min_tokens` | INT | `8192` | 低于此打包序列长度时使用原版注意力 forward。 |
+| `min_tokens` | INT | `4096` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `dense_percent` | FLOAT | `0.0` | 在采样的前此比例内保持原版稠密注意力 —— Sol-Attn 论文的配方为 `0.2`。`0` 表示关闭。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
 | `sink_conditioning` | COMBO | `exact_kv` | 与节点 2 相同的条件汇聚选择。 |
+| `dense_blocks` | STRING | 空 | 与节点 2 相同的稠密块规格。 |
 
 **输出:** `model`(`MODEL`)、`tau_graph`(`IMAGE`)—— 接入 Preview Image 节点即可查看调度曲线。
 
@@ -145,9 +164,11 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `model` | MODEL | 必填 | MiniMax H3 模型。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
 | `chunks` | INT | `2` | 更多分块可进一步压低 MLP 峰值激活显存。 |
-| `min_tokens` | INT | `4096` | 低于此打包序列长度时保持原版全宽 MLP。 |
+| `min_tokens` | INT | `8192` | 低于此打包序列长度时保持原版全宽 MLP。 |
 
 分块在数学上逐 token 独立,并保留 H3 的 INT8 ConvRot 路径(其激活缩放为逐行);测试中输出逐位一致。需要梯度的输入将使用原始未分块 MLP。
+
+收益随打包序列长度线性增长:中间张量每 token 占 56 KB,因此节省量从 8K tokens 的约 238 MiB 增长到 65K 的约 1.9 GiB(实测,×2 分块,int8 检查点)。低于 `min_tokens` 时本节点完全不生效 —— 想在短视频上也获得缓解就调低,只关心长视频就调高。
 
 **输出:** `model`(`MODEL`)
 
@@ -172,7 +193,7 @@ H3 尺寸(B=1,H=56,D=128,bf16),随机张量,autotune 热身后取 20 次迭代�
 | 32,768 | 352.15 | 55.90 | 38.73 | 1.44× | 9.09× |
 | 65,536 | 1,350.54 | 221.06 | 153.56 | 1.44× | 8.79× |
 
-- 2,048 tokens 处的 `0.67× vs Sage` 表示**该长度下 Sage 更快** —— 约 4K tokens 以下 Sage 明显占优,这就是 `min_tokens` 默认 8,192 的原因。
+- 2,048 tokens 处的 `0.67× vs Sage` 表示**该长度下 Sage 更快** —— 约 4K tokens 以下 Sage 明显占优。`min_tokens` 默认 4,096;若只想要已实测的赢面,可提高到 8,192。
 - SageAttention 是公平基线。列出 PyTorch SDPA 仅因其他 Sol-Attn 插件引用它 —— 在这些尺寸下它并未使用有竞争力的内核路径。
 - 随机高斯输入是 Sol-Attn 内容相关路由的最差情况,真实提示词应达到或超过这些比值;多次运行间存在几个百分点的波动。
 - 通用节点的 q/k/v 拷贝每次调用额外消耗 0.2–2 ms(视长度而定,见测试输出中的 "Sol generic")。
@@ -241,7 +262,7 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 [MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=4096)
 ```
 
-每种回退原因每次运行只记录一次。另请注意编译开销:Triton 以 `key=["T"]` 做 autotune,**每个新 token 数的首次运行都会在采样循环内支付一次 JIT 扫描** —— 改分辨率或时长就要再付一次。请在第二次运行时测量。
+每种回退原因每次运行只记录一次。另请注意编译开销:Triton 以 `key=["T"]` 做 autotune,**每个新 token 数的首次运行都会在采样循环内支付一次 JIT 扫描** —— 计时结果会缓存到磁盘,因此同一 token 数全局只付一次,但改分辨率或时长后新尺寸仍需再付一次。请在第二次运行时测量。
 
 ## 注意事项
 
