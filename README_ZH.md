@@ -59,6 +59,8 @@ Python 3.12.10    ·  ComfyUI 0.30.0      ·  Windows 11
 MiniMax H3(56 头 × 128,bf16,mask=None)—— 满足全部内核约束
 ```
 
+社区测试于 **NVIDIA DGX Spark**(SM121,aarch64,CUDA 13.0,Triton 3.6.0)—— DGX Spark 数据见 [BENCHMARKS.md](BENCHMARKS.md)。Sol-Attn 相对 SageAttention 的加速比在该设备上更高(1.48–1.92×),因为 GB10 的 LPDDR5X 统一内存受限于带宽,而 Sol-Attn 节省带宽。
+
 Sol-Attn 运行时约束:`head_dim` 必须恰好为 128、bf16、无注意力掩码、4D q/k/v 且为连续或 TMA 兼容跨步布局。不满足时将回退,并按原因各记录一次日志。
 
 ## 节点接入顺序

@@ -112,3 +112,15 @@ Our residual int8 design (`int8_qk`) is ~3.6× closer to the exact bf16 Sol path
 4. **Pipeline:** the sage+Sol combo (dense first 20% + ramped Sol) delivers 1.22–1.26× over pure SageAttention on the attention math, and the int8 combo beats even all-Sol bf16.
 5. KingGore's flex path is quick but answers a different question (hard mask, ~8–11% density) — do not compare it on speed alone.
 6. Sol-Attn's advantage over SageAttention grows with sequence length; below ~4K tokens Sage stays the right default.
+
+## Community benchmark: DGX Spark (SM121, 2026-08-07)
+
+Contributed by a community user on **NVIDIA DGX Spark** (SM121, aarch64, CUDA 13.0, Triton 3.6.0). `B=1, H=24, D=128`, bf16, median of 10 after autotune warmup. Speedup is `SageAttention / Sol-Attn`:
+
+| tokens | SDPA | SageAttention | Sol-Attn bf16 | Sol-Attn int8_qk | vs Sage | vs Sage (int8) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 | 9.42 | 6.53 | 4.42 | 3.87 | 1.48× | 1.69× |
+| 16,384 | 38.03 | 22.78 | 14.91 | 12.52 | 1.53× | 1.82× |
+| 32,768 | 152.94 | 86.89 | 55.72 | 45.36 | 1.56× | 1.92× |
+
+These ratios are above the 1.19–1.55× this README measures on RTX 5090. That is expected rather than surprising: Sol-Attn skips loading whole K/V blocks, so it saves memory bandwidth, and the DGX Spark's GB10 is bandwidth-bound (LPDDR5X unified memory) far more than an RTX 5090 is. A bandwidth-saving method returns more on this hardware. Absolute times are much slower than a 5090; only the ratios transfer.

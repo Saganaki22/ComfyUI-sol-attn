@@ -62,6 +62,8 @@ Python 3.12.10    ·  ComfyUI 0.30.1      ·  Windows 11
 MiniMax H3 (56 heads × 128, bf16, mask=None) — satisfies all kernel constraints
 ```
 
+Community-tested on **NVIDIA DGX Spark** (SM121, aarch64, CUDA 13.0, Triton 3.6.0) — see [BENCHMARKS.md](BENCHMARKS.md) for the DGX Spark numbers. Sol-Attn's speedup over SageAttention is higher there (1.48–1.92×) because the GB10's LPDDR5X unified memory is bandwidth-bound and Sol-Attn saves bandwidth.
+
 Sol-Attn's runtime constraints: `head_dim` exactly 128, bf16, no attention mask, 4D q/k/v with contiguous or TMA-compatible strides. Anything else falls back and logs the reason once per cause.
 
 <img width="1713" height="448" alt="Screenshot 2026-08-05 170148" src="https://github.com/user-attachments/assets/f9accb38-211e-4c02-afda-2f4c59c08b4d" />
