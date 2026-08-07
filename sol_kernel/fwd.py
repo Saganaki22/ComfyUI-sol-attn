@@ -88,8 +88,8 @@ def _validate(q, k, v, kv_splits, thresh_type):
     if kv_splits > route_groups:
         raise ValueError("each KV split must contain at least one N64 route group")
     arch = torch.cuda.get_device_capability(q.device)
-    if arch not in ((9, 0), (10, 0), (12, 0), (8, 9)):
-        raise RuntimeError("Sol-Attn supports SM89, SM90, SM100, and SM120")
+    if arch not in ((9, 0), (10, 0), (12, 0), (12, 1), (8, 9)):
+        raise RuntimeError("Sol-Attn supports SM89, SM90, SM100, SM120, SM121")
     return arch
 
 
