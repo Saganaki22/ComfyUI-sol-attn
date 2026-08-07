@@ -19,7 +19,7 @@ except Exception:  # Triton or ComfyUI kitchen ops unavailable; FFN node still l
     sol_attn = None
     PackedLayout = None
 
-SOL_ARCHES = {(8, 9), (9, 0), (10, 0), (12, 0)}
+SOL_ARCHES = {(8, 9), (9, 0), (10, 0), (12, 0), (12, 1)}
 
 
 class _ChunkLog:
