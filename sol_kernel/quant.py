@@ -11,9 +11,15 @@ so the kernels also run on pre-Hopper arches.
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 BLOCK_SIZE = 64
+
+
+@triton.jit
+def _round_to_int8(x):
+    """Round-to-nearest-int via int32 truncation, avoiding libdevice.rint
+    (unavailable on some Triton builds)."""
+    return tl.where(x >= 0, (x + 0.5).to(tl.int32), (x - 0.5).to(tl.int32)).to(tl.int8)
 
 
 @triton.jit
@@ -43,7 +49,7 @@ def _quantize_k_kernel(
     centered = tl.where(valid[:, None], tile - mean[None, :], 0.0)
     amax = tl.max(tl.abs(centered), axis=1)
     scale = tl.maximum(amax / 127.0, 1e-8)
-    k8 = libdevice.rint(centered / scale[:, None]).to(tl.int8)
+    k8 = _round_to_int8(centered / scale[:, None]).to(tl.int8)
     tl.store(
         k8_ptr + ((batch * T + rows[:, None]) * H + head) * D + d[None, :],
         k8,
@@ -84,7 +90,7 @@ def _q_quant_threshold_kernel(
 
     amax = tl.max(tl.abs(tile), axis=1)
     scale = tl.maximum(amax / 127.0, 1e-8)
-    q8 = libdevice.rint(tile / scale[:, None]).to(tl.int8)
+    q8 = _round_to_int8(tile / scale[:, None]).to(tl.int8)
     tl.store(
         q8_ptr + ((batch * T + rows[:, None]) * H + head) * D + d[None, :],
         q8,
@@ -157,4 +163,59 @@ def quantize_q_with_threshold(q, kc_mean, kc_var, *, scale, tau):
     return q8, q_scale, threshold
 
 
-__all__ = ["quantize_k", "quantize_q_with_threshold"]
+@triton.jit
+def _quantize_v_kernel(
+    v_ptr,
+    scale_ptr,
+    vi_ptr,
+    T,
+    s_b, s_t, s_h,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """Per-channel INT8 V quantization: one scale per (batch*head, channel)."""
+    row_tile, batch_head = tl.program_id(0), tl.program_id(1)
+    batch, head = batch_head // H, batch_head % H
+    rows = row_tile * ROWS + tl.arange(0, ROWS)
+    d = tl.arange(0, D)
+    valid = rows < T
+    tile = tl.load(
+        v_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    s = tl.load(scale_ptr + batch_head * D + d)
+    v8 = _round_to_int8(tile / s[None, :]).to(tl.int8)
+    tl.store(
+        vi_ptr + ((batch * T + rows[:, None]).to(tl.int64) * H + head) * D + d[None, :],
+        v8,
+        mask=valid[:, None],
+    )
+
+
+def quantize_v_per_channel(v, rows=16):
+    """v [B, T, H, D] bf16. Returns v_int8 [B, T, H, D], v_scale [B*H, D] fp32.
+
+    PV is out[m,d] = sum_k P[m,k] V[k,d], so a per-channel V scale and a
+    per-row P scale both factor straight out of the int32 dot.
+    """
+    batch, tokens, heads, head_dim = v.shape
+    scale = v.abs().amax(dim=1).float().div_(127.0).clamp_min_(1e-8)
+    scale = scale.reshape(batch * heads, head_dim).contiguous()
+    vi = torch.empty(v.shape, device=v.device, dtype=torch.int8)
+    _quantize_v_kernel[(triton.cdiv(tokens, rows), batch * heads)](
+        v,
+        scale,
+        vi,
+        tokens,
+        v.stride(0), v.stride(1), v.stride(2),
+        heads,
+        head_dim,
+        rows,
+        num_warps=4,
+    )
+    return vi, scale
+
+
+__all__ = ["quantize_k", "quantize_q_with_threshold", "quantize_v_per_channel"]

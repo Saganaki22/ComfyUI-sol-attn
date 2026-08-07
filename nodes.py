@@ -45,7 +45,7 @@ class _DispatchLog:
             log.info("[Sol-Attn] dense fallback: %s", reason)
 
 
-def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None, thresh_type: str = "diag", int8_qk: bool = False):
+def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=None, thresh_type: str = "diag", int8_qk: bool = False, int8_pv: bool = False):
     dispatch_log = _DispatchLog()
 
     def override(func, q, k, v, heads, *args, **kwargs):
@@ -91,6 +91,7 @@ def _make_override(tau: float, min_tokens: int, strict: bool, fallback_override=
                 tau=tau,
                 thresh_type=thresh_type,
                 int8_qk=int8_qk,
+                int8_pv=int8_pv,
             )  # (B, T, H, D)
 
             dispatch_log.hit()
@@ -169,6 +170,15 @@ class SolAttentionPatch:
                         "~1% extra numerical error; slightly slower at 8K.",
                     },
                 ),
+                "int8_pv": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
+                        "per-channel V). More speed on top of int8_qk at additional "
+                        "accuracy cost. Requires int8_qk. Opt-in.",
+                    },
+                ),
             }
         }
 
@@ -182,7 +192,7 @@ class SolAttentionPatch:
         "your normal backend for any shape it can't handle."
     )
 
-    def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag", int8_qk=False):
+    def patch(self, model, enabled, tau, min_tokens=8192, strict=False, thresh_type="diag", int8_qk=False, int8_pv=False):
         if not enabled:
             return (model,)
         m = model.clone()
@@ -197,6 +207,7 @@ class SolAttentionPatch:
             fallback_override,
             thresh_type,
             bool(int8_qk),
+            bool(int8_pv),
         )
         m.model_options["transformer_options"] = opts
         log.info(

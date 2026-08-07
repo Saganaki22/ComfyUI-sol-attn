@@ -1,16 +1,32 @@
 # Benchmarks
 
-**Date:** 2026-08-04 · **Machine:** RTX 5090 (SM120) · torch 2.10.0+cu130 · Triton 3.6.0 · Python 3.12.10 · Windows 11
+**Date:** 2026-08-07 · **Machine:** RTX 5090 (SM120) · torch 2.10.0+cu130 · Triton 3.6.0 · Python 3.12.10 · Windows 11
 
 ## Method
 
-All Sol-Attn implementations are given the **same inputs**: MiniMax H3-shaped strided NHD views into a fused qkv projection buffer (`B=1, H=56, D=128`, bf16, random Gaussian tensors), `tau=1.0`, median of 20 timed iterations after 3 warmup iterations (which absorb Triton autotune / torch.compile). SageAttention and PyTorch SDPA are the dense baselines.
+All Sol-Attn implementations are given the **same inputs**: MiniMax H3-shaped strided NHD views into a fused qkv projection buffer (`B=1, H=56, D=128`, bf16, random Gaussian tensors), `tau=1.0`, median of 20 timed iterations after 3 warmup iterations (which absorb Triton autotune / torch.compile). SageAttention and PyTorch SDPA are the dense baselines. kijai's repo is benchmarked from commit `0a92202` (latest at time of writing).
 
 > Fidelity warning: these methods are not interchangeable. KingGore's fork uses a **hard block mask** (unselected KV blocks are dropped, ~8–11% density by its own README) while the Sol-Attn implementations keep an approximate correction for unselected blocks (~16% exact at `tau=1.0`). Faster-by-sparser is not the same thing as faster-by-engineering — A/B the visual quality before adopting any of them.
 
-## Results (ms per attention call, lower is better)
+## Speed (ms per attention call, lower is better)
 
-Rerun 2026-08-05 against kijai's updated repo (pointer-kernels-by-default + lean autotune, landed in the preceding 15 hours). Same method as before:
+Full cross-repo rerun 2026-08-07. All eight methods on the same inputs in one session:
+
+| Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
+|---|---:|---:|---:|---:|
+| PyTorch SDPA | 22.49 | 96.86 | 349.03 | 1,405.18 |
+| SageAttention | 3.80 | 15.15 | 54.69 | 234.51 |
+| KingGore flex | 4.57 | 10.56 | 32.23 | 134.77 |
+| kijai bf16 | 2.90 | 9.05 | 33.16 | 145.33 |
+| kijai int8 | **2.60** | **7.78** | **27.85** | **113.88** |
+| ours bf16 | 3.20 | 10.37 | 37.91 | 151.63 |
+| ours int8_qk | 2.52 | 8.17 | 28.75 | 114.81 |
+| ours int8_qk+pv | 3.04 | 8.91 | 29.99 | 118.11 |
+
+**Read on the 2026-08-07 numbers:** our `int8_qk` is fastest at 8K (2.52 vs kijai's 2.60). kijai leads at 16K–65K by ~3–5% on int8. Our bf16 path is ~10–15% behind his bf16 at every size — the difference is autotune configurations and his fused-preprocess rework (commit `0a92202`, not the installed `0e334dc` which was bit-identical to ours). `int8_pv` does not beat `int8_qk` alone in this run (earlier isolated bench showed a marginal win at 32K+; autotune variance flipped it). Our int8 remains ~3.6× more accurate than his (0.008 vs 0.029 rel L2 vs the bf16 path).
+
+<details>
+<summary>Previous run (2026-08-05, installed kijai 0e334dc)</summary>
 
 | Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
 |---|---:|---:|---:|---:|
@@ -22,10 +38,10 @@ Rerun 2026-08-05 against kijai's updated repo (pointer-kernels-by-default + lean
 | ours bf16 | 3.33 | 11.57 | 44.95 | 162.14 |
 | ours int8 | 2.72 | 8.64 | 31.30 | 118.02 |
 
-**Read on the 2026-08-05 numbers:** after kijai's pointer-default update his kernels lead ours by ~3–10% on speed at every size, bf16 and int8 alike (his pointer path no longer copies either). Our int8 remains ~3.7× more accurate than his (0.008 vs 0.030 rel L2 vs the exact bf16 path), and this repo's edge is the feature set around the kernel: scheduled tau with graph preview, dense-step and dense-block gates, conditioning sinks, FFN chunking, and the validation suite. KingGore's flex row remains a different method (hard block mask, ~8–11% density) — not comparable on fidelity.
+</details>
 
 <details>
-<summary>Previous run (2026-08-04, pre-update kijai repo)</summary>
+<summary>Original run (2026-08-04, pre-update kijai repo)</summary>
 
 | Method | 8,192 tokens | 16,384 | 32,768 | 65,536 |
 |---|---:|---:|---:|---:|
@@ -62,33 +78,37 @@ Peak attention memory above resident on the same inputs (our zero-copy path vs t
 
 Correctness on the same machine: strided output bit-identical to contiguous input (including ragged lengths 8,191 / 12,345 / 38,247 and 103,237 tokens after the v0.4.8 int64-addressing fix); all-exact mode matches PyTorch SDPA at relative L2 `0.00097`; `int8_qk` matches the bf16 path at `0.0080` and SDPA at `0.0098`. Run-to-run timing variance is a few percent; the 32,768-token int8 row flips between runs. Note that **PyTorch SDPA itself overflows int32 strides** on H3's strided qkv views past ~100K tokens — stock attention backends have their own ceiling there.
 
-## Accuracy (relative L2 error, same random inputs)
+## Accuracy (relative L2 error, same random inputs, 2026-08-07)
 
-`vs SDPA (all-exact)` isolates each kernel's numerics with routing forced fully dense (`tau=-100`). `vs ours bf16` isolates the int8 designs from the shared Sol approximation. The `vs SDPA (tau=1)` column is Sol's approximation error on pure noise — the worst case for a structure-exploiting method; structured real-world attention distributions have far more routing headroom. kijai bf16 and ours bf16 measure **0.000000** against each other: the two repos are bit-identical implementations of the same math.
+`vs SDPA (all-exact)` isolates each kernel's numerics with routing forced fully dense (`tau=-100`). `vs ours bf16` isolates the int8 designs from the shared Sol approximation.
 
-| Method | vs SDPA (all-exact), 8K | vs SDPA (all-exact), 32K | vs ours bf16 (tau=1), 8K | vs ours bf16 (tau=1), 32K |
-|---|---:|---:|---:|---:|
-| SageAttention (dense int8) | 0.0390 | 0.0393 | — | — |
-| KingGore flex (hard mask) | 2.0557 | 2.2363 | 2.5484 | 2.8165 |
-| kijai bf16 | 0.00097 | 0.00078 | 0.000000 | 0.000000 |
-| kijai int8 | 0.00987 | 0.00987 | 0.02995 | 0.02910 |
-| ours bf16 | 0.00097 | 0.00078 | 0 | 0 |
-| **ours int8** | **0.00980** | **0.00980** | **0.00802** | **0.00793** |
+> kijai's bf16 path diverged from ours by 0.0018 on commit `0a92202` — his fused-preprocess rework changed the kernel's numerics slightly. The installed commit `0e334dc` (the one most ComfyUI users have) was bit-identical (0.000000) in the 2026-08-05 run.
 
-Our residual int8 design is ~3.7× closer to the exact bf16 Sol path than full-key int8 quantization, at equal or better speed.
+| Method | vs SDPA (all-exact), 8K | vs ours bf16 (tau=1), 8K |
+|---|---:|---:|
+| SageAttention (dense int8) | 0.0390 | — |
+| KingGore flex (hard mask) | 2.0557 | 2.5484 |
+| kijai bf16 | 0.00097 | 0.00181 |
+| kijai int8 | 0.00987 | 0.02855 |
+| ours bf16 | 0.00097 | 0 |
+| **ours int8_qk** | **0.00980** | **0.00803** |
+| ours int8_qk+pv | 0.01741 | 0.01398 |
+
+Our residual int8 design (`int8_qk`) is ~3.6× closer to the exact bf16 Sol path than full-key int8 quantization (0.008 vs 0.029 rel L2). `int8_pv` adds V quantization on top, degrading to 0.014 rel L2 — still 2.1× more accurate than kijai's full-key int8. Default off; enable only when the extra speed at long sequences matters and the accuracy trade-off is acceptable.
 
 ## The repos compared
 
-- **[Saganaki22/ComfyUI-sol-attn](https://github.com/Saganaki22/ComfyUI-sol-attn)** (this repo) — NVIDIA's Sol-Attn Triton reference, vendored and extended. Feeds the kernel H3's fused qkv views with zero copies (TMA on SM90/100/120, pointer twins on SM89). The `int8_qk` path quantizes only the per-block-mean *residual* of K (per-token scales) and adds the mean back from the exact bf16 routing scores, which is why its accuracy (0.008 rel L2) beats full-key int8 designs. Also ships scheduled tau, conditioning sinks, and FFN chunking.
-- **[kijai/ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton)** — independent Triton implementation of the same kernel. Clean design: SM89 pointer kernels, fused preprocess, conditioning sinks, Morton token reordering, sigma gating. Its TMA path materializes contiguous q/k/v copies (its SM89 pointer path avoids them). Its int8 uses global-mean K smoothing over full-magnitude keys. Fastest int8 at 32K on this run; ours leads the other three sizes.
+- **[Saganaki22/ComfyUI-sol-attn](https://github.com/Saganaki22/ComfyUI-sol-attn)** (this repo) — NVIDIA's Sol-Attn Triton reference, vendored and extended. Feeds the kernel H3's fused qkv views with zero copies (TMA on SM90/100/120/121, pointer twins on SM89). The `int8_qk` path quantizes only the per-block-mean *residual* of K (per-token scales) and adds the mean back from the exact bf16 routing scores, which is why its accuracy (0.008 rel L2) beats full-key int8 designs. `int8_pv` additionally quantizes P·V (per-token P, per-channel V) — opt-in. Also ships scheduled tau, conditioning sinks, FFN chunking, and SM121 (DGX Spark) support.
+- **[kijai/ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton)** — independent Triton implementation of the same kernel. Clean design: SM89 pointer kernels, fused preprocess, conditioning sinks, Morton token reordering, sigma gating. Its int8 uses global-mean K smoothing over full-magnitude keys. Fastest int8 at 16K–65K on this run; ours leads at 8K.
 - **[KingGore/ComfyUI_sol-attn_Blackwell](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell)** — routes in pure torch and executes the selected blocks with compiled PyTorch `flex_attention`. Legitimately fast (beats SageAttention past 8K), but it is a **different sparsity method**: hard block mask, no approximate correction, much lower density. Compare its quality, not just its speed. SM120 only.
 - **[SageAttention](https://github.com/thu-ml/SageAttention)** (thu-ml) — the dense int8 attention baseline everything here is measured against. Still the right choice below ~4K tokens, which is why our nodes gate on `min_tokens`.
 - **PyTorch SDPA** — stock ComfyUI backend, shown for scale; at these lengths it does not select a competitive kernel path.
 
-## Takeaways (2026-08-05)
+## Takeaways (2026-08-07)
 
-1. **Speed:** kijai's updated kernels lead by ~3–10% at every size; ours is within that margin everywhere, and the two bf16 paths are bit-identical math. The gap is small enough that per-GPU autotune variance can flip it.
-2. **Accuracy:** our residual int8 design is ~3.7× closer to the exact bf16 path than full-key int8 (0.008 vs 0.030 rel L2) — the quality-first int8 option.
-3. **Pipeline:** the sage+Sol combo (dense first 20% + ramped Sol) delivers 1.23–1.30× over pure SageAttention on the attention math, and the int8 combo beats even all-Sol bf16.
-4. KingGore's flex path is quick but answers a different question (hard mask, ~8–11% density) — do not compare it on speed alone.
-5. Sol-Attn's advantage over SageAttention grows with sequence length; below ~4K tokens Sage stays the right default.
+1. **Speed:** our `int8_qk` leads at 8K (2.52 ms); kijai's int8 leads at 16K–65K by ~3–5%. The bf16 gap widened to ~10–15% after his `0a92202` fused-preprocess rework (the installed `0e334dc` was bit-identical to ours and ~equal speed). Run-to-run autotune variance can flip margins at the margins.
+2. **Accuracy:** our residual `int8_qk` is ~3.6× closer to the exact bf16 path than full-key int8 (0.008 vs 0.029 rel L2). `int8_pv` trades to 0.014 for marginal speed — still 2.1× better than kijai's int8.
+3. **int8_pv:** opt-in, default off. In this run it did not beat `int8_qk` alone at any size; an earlier isolated bench showed a marginal win at 32K+ that autotune variance flipped. Keep for the option; don't enable by default.
+4. **Pipeline:** the sage+Sol combo (dense first 20% + ramped Sol) delivers 1.22–1.26× over pure SageAttention on the attention math, and the int8 combo beats even all-Sol bf16.
+5. KingGore's flex path is quick but answers a different question (hard mask, ~8–11% density) — do not compare it on speed alone.
+6. Sol-Attn's advantage over SageAttention grows with sequence length; below ~4K tokens Sage stays the right default.

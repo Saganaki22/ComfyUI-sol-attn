@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.5.0**
+**Version: v0.5.5**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -18,19 +18,19 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 ## Why this repo
 
-Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-05):
+Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full tables in [BENCHMARKS.md](BENCHMARKS.md), 2026-08-07):
 
-- **Within ~3–10% of the fastest Sol kernel** (kijai's Triton node) at every size, with the two bf16 paths bit-identical in output — the remaining difference is what surrounds the kernel.
-- **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.7× closer than full-key int8 designs (0.030).
+- **Fastest int8 at 8K tokens** (2.52 ms vs kijai's 2.60); within 3–5% at 16K–65K — the two bf16 paths were bit-identical on the installed commit `0e334dc`; his latest `0a92202` rework diverged slightly.
+- **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.6× closer than full-key int8 designs (0.029).
 - **Zero-copy by design** — the kernel reads H3's fused qkv views directly; no contiguous copies, 1.3–2.7 GiB lower peak at long lengths.
 - **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).
-- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), SM89–SM120 support, and honest per-call fallback.
+- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), int8 q/k and P·V quantization, SM89–SM121 support, and honest per-call fallback.
 
 ## Features
 
 - **Opt-in per-model patching** — only the model you wire through a node is affected; the rest of your graph is untouched.
 - **Two Sol-Attn integration paths** — a generic hook-based node for any model, and a MiniMax H3 node that feeds the kernel strided views of the fused qkv projection with zero q/k/v copies, plus an exact-KV sink for H3's packed conditioning rows.
-- **SM89 through SM120** — TMA descriptor kernels on SM90/100/120, pointer kernel twins on SM89 (RTX 40-series).
+- **SM89 through SM121** — TMA descriptor kernels on SM90/100/120/121, pointer kernel twins on SM89 (RTX 40-series). SM121 covers the DGX Spark.
 - **Scheduled sparsity** — ramp `tau` across sampling (sparse early, dense late) with a plotted schedule preview.
 - **Feed-forward chunking** — caps MiniMax H3's MLP peak activation memory, bit-identical output.
 - **Honest fallback** — any shape or GPU the kernel can't handle uses your normal attention backend and logs why; `strict` mode raises instead while validating a new environment.
@@ -38,7 +38,7 @@ Measured on an RTX 5090 against the other Sol-Attn ComfyUI implementations (full
 
 ## Prerequisites
 
-- NVIDIA GPU: **SM89, SM90, SM100, or SM120** — SM90/100/120 run the TMA kernel path; SM89 (RTX 40-series) runs pointer kernel twins. Only SM120 is tested on hardware by this repository; the SM89 path is validated by forced dispatch, not on an SM89 GPU.
+- NVIDIA GPU: **SM89, SM90, SM100, SM120, or SM121** — SM90/100/120/121 run the TMA kernel path; SM89 (RTX 40-series) runs pointer kernel twins. Only SM120 is tested on hardware by this repository; SM121 (DGX Spark) is enabled by PR #3 and shares the same TMA path; the SM89 path is validated by forced dispatch, not on an SM89 GPU.
 - PyTorch with CUDA, **bfloat16** support
 - **Triton** with `triton.tools.tensor_descriptor` (TMA) — verified on 3.6.0
 - ComfyUI (developed against 0.30.0)
@@ -106,6 +106,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
 | `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
 | `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. Measured 1.2–1.3× faster above 16K tokens at ~1% extra numerical error; slightly slower at 8K. This is a repository addition, not part of NVIDIA's source. |
+| `int8_pv` | BOOLEAN | `False` | Additionally quantize the P·V dot to int8 (per-token P, per-channel V). Requires `int8_qk`. At 32K+ tokens measures ~1.04× faster than int8_qk alone; slower at 8K–16K. Accuracy drops to 0.014 rel L2 vs bf16 (from 0.008 with int8_qk alone). Opt-in. |
 
 **Output:** `model` (`MODEL`)
 
@@ -129,6 +130,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
+| `int8_pv` | BOOLEAN | `False` | Same int8 P·V toggle as node 1. Requires `int8_qk`. |
 | `sink_conditioning` | COMBO | `exact_kv` | Keep H3's packed text/conditioning/reference/audio KV blocks exact (~3% cost, protects prompt adherence and audio sync). `exact_kv_and_rows` also runs those query rows dense (~20% cost). `off` disables the sink. |
 | `dense_blocks` | STRING | empty | Transformer blocks to keep dense, e.g. `0-2,-1` for the first three and the last (negative counts from the end). First/last blocks are the most approximation-sensitive. Empty sparsifies all. |
 
@@ -155,6 +157,7 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 | `dense_percent` | FLOAT | `0.0` | Keep the stock dense attention for this fraction of early sampling — the Sol-Attn paper's recipe is `0.2`. `0` disables the gate. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
 | `int8_qk` | BOOLEAN | `False` | Same int8 q/k toggle as node 1. |
+| `int8_pv` | BOOLEAN | `False` | Same int8 P·V toggle as node 1. Requires `int8_qk`. |
 | `sink_conditioning` | COMBO | `exact_kv` | Same conditioning-sink choice as node 2. |
 | `dense_blocks` | STRING | empty | Same dense-block spec as node 2. |
 
@@ -196,16 +199,16 @@ H3 width (B=1, H=56, D=128, bf16), random tensors, median of 20 iterations after
 | tokens | PyTorch SDPA (ms) | SageAttention (ms) | Sol-Attn strided (ms) | vs Sage | vs SDPA |
 |---:|---:|---:|---:|---:|---:|
 | 2,048 | 1.45 | 0.60 | 0.89 | 0.67× | 1.63× |
-| 8,192 | 23.96 | 3.72 | 3.25 | 1.14× | 7.36× |
-| 16,384 | 84.95 | 13.94 | 10.08 | 1.38× | 8.42× |
-| 32,768 | 352.15 | 55.90 | 38.73 | 1.44× | 9.09× |
-| 65,536 | 1,350.54 | 221.06 | 153.56 | 1.44× | 8.79× |
+| 8,192 | 22.49 | 3.80 | 3.20 | 1.19× | 7.03× |
+| 16,384 | 96.86 | 15.15 | 10.37 | 1.46× | 9.34× |
+| 32,768 | 349.03 | 54.69 | 37.91 | 1.44× | 9.21× |
+| 65,536 | 1,405.18 | 234.51 | 151.63 | 1.55× | 9.27× |
 
 - `0.67× vs Sage` at 2,048 tokens means **Sage is faster there** — below roughly 4K tokens Sage wins outright. `min_tokens` defaults to 4,096; raise it toward 8,192 if you want only the measured wins.
 - SageAttention is the fair baseline. PyTorch SDPA is shown only because other Sol-Attn plugins quote it — at these sizes it does not use a competitive kernel path.
 - Random Gaussian inputs are the worst case for Sol-Attn's content-dependent routing, so real prompts should meet or beat these ratios; repeated runs vary by a few percent.
 - The generic node's q/k/v copies cost a further 0.2–2 ms per call depending on length ("Sol generic" in the test output).
-- With `int8_qk` enabled (repository addition), the same strided path measures 0.97× at 8,192, 1.30× at 16,384, 1.21× at 32,768, and 1.18× at 65,536 relative to the bf16 numbers above, at ~1% extra numerical error.
+- With `int8_qk` enabled (repository addition), the same strided path measures 1.27× faster than bf16 at 8K, 1.27× at 16K, 1.32× at 32K, and 1.32× at 65K (2.52 / 8.17 / 28.75 / 114.81 ms), at ~1% extra numerical error. `int8_pv` additionally quantizes P·V — opt-in, marginal speed change, accuracy drops to 0.014 rel L2.
 
 Full-model context: one controlled pair (MiniMax H3, 15 s, 480×864, 20 steps, `res_multistep`, fixed seed, same input image) measured Sage 9.91 s/it → Sol 8.92 s/it (−10%) with the hook-based node.
 
@@ -276,9 +279,9 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 
 - **Sol-Attn is approximate.** Output will not be bit-identical to dense attention; whether that shows in your content is your call — A/B it with `enabled`.
 - **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); the `sink_conditioning` option implements the paper's exact conditioning-K/V handling, but dense first-layer scheduling and the rest of the paper's more conservative recipe are not implemented.
-- **SM120 support is this repository's change**, not NVIDIA's. NVIDIA's public source gate still names SM90/SM100. Report numerics issues here, not upstream against NVlabs/Sana.
+- **SM120/SM121 support is this repository's change**, not NVIDIA's. NVIDIA's public source gate still names SM90/SM100. SM121 (DGX Spark) was added via community PR #3. Report numerics issues here, not upstream against NVlabs/Sana.
 - **The H3-specific nodes bypass ComfyUI's attention hook.** Other patches attached to `optimized_attention_override` do not run on blocks where Sol is active, and attention `transformer_options` patches are not applied on the Sol path.
-- **The strided-view TMA layout is relaxed in this repository's copy of the validator**, exercised on SM120 only and verified at ragged sequence lengths (e.g. 38,247 tokens, real H3 size). The SM89 pointer kernels are validated by forced dispatch on SM120, not on SM89 hardware. Run with `strict=true` once on a new environment.
+- **The strided-view TMA layout is relaxed in this repository's copy of the validator**, exercised on SM120 only and verified at ragged sequence lengths (e.g. 38,247 tokens, real H3 size). SM121 uses the same TMA path as SM120 but is not hardware-tested by this repository. The SM89 pointer kernels are validated by forced dispatch on SM120, not on SM89 hardware. Run with `strict=true` once on a new environment.
 - NVIDIA's published ~2.0–2.3× figures are for Sol-Engine as a whole (CuTe kernels, NVFP4, block fusion, datacenter GPUs). This is the Triton reference kernel alone — a different thing entirely.
 - The [KingGore Blackwell fork](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell) was evaluated at H3 width: 4.334 ms for its `flex_attention` path vs 3.256 ms for this Triton reference at 8,192 tokens. It uses a hard block mask (unselected blocks are dropped, not approximated), so it is a different method, and its import-time repair that moves files inside the installed PyTorch package is intentionally excluded here.
 

@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.5.0**
+**版本: v0.5.5**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -15,19 +15,19 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 
 ## 为什么选择本仓库
 
-在 RTX 5090 上与其他 Sol-Attn ComfyUI 实现实测对比(完整表格见 [BENCHMARKS.md](BENCHMARKS.md),2026-08-04):
+在 RTX 5090 上与其他 Sol-Attn ComfyUI 实现实测对比(完整表格见 [BENCHMARKS.md](BENCHMARKS.md),2026-08-07):
 
-- **8K / 16K / 65K tokens 下最快的 int8 注意力**(2.56 / 8.64 / 108.95 ms),32K 处差距约 10% 以内 —— 对比 kijai 的 Triton 节点、KingGore 的 flex 分支与 SageAttention。
-- **最佳的 int8 精度** —— 本内核仅量化 K 的块内*残差*,均值项以 bf16 精确保留:相对 L2 误差 0.008,比全键 int8 设计(0.030)接近精确路径约 3.7 倍。
+- **8K tokens 下最快的 int8**(2.52 ms,kijai 为 2.60);16K–65K 差距在 3–5% 以内 —— 两者 bf16 路径在已安装提交 `0e334dc` 上逐位一致;其最新 `0a92202` 重构略有偏差。
+- **最佳的 int8 精度** —— 本内核仅量化 K 的块内*残差*,均值项以 bf16 精确保留:相对 L2 误差 0.008,比全键 int8 设计(0.029)接近精确路径约 3.6 倍。
 - **零拷贝设计** —— 内核直接读取 H3 融合 qkv 投影的视图;其他 TMA 实现会先拷贝 q/k/v(长序列下额外增加 1.3–2.7 GiB 峰值显存与拷贝时间)。
 - **数学实现交叉验证** —— 本仓库 bf16 路径与 kijai 的独立实现逐位一致(0.000000),全精确模式与 SDPA 一致(0.00097)。
-- **不止于内核** —— 带曲线预览的调度 tau、条件精确 KV 汇聚、前馈分块(MLP 峰值 −37%)、SM89–SM120 支持,以及诚实的逐调用回退。
+- **不止于内核** —— 带曲线预览的调度 tau、条件精确 KV 汇聚、前馈分块(MLP 峰值 −37%)、int8 q/k 与 P·V 量化、SM89–SM121 支持,以及诚实的逐调用回退。
 
 ## 功能特性
 
 - **按需逐模型打补丁** —— 只有接入节点的模型受影响,工作流其余部分不受影响。
 - **两条 Sol-Attn 集成路径** —— 适用于任意模型的通用钩子节点,以及 MiniMax H3 专用节点:将融合 qkv 投影的跨步视图直接送入内核,零 q/k/v 拷贝,并为 H3 打包的条件行提供精确 KV 汇聚。
-- **SM89 至 SM120** —— SM90/100/120 使用 TMA 描述符内核,SM89(RTX 40 系列)使用指针内核孪生版本。
+- **SM89 至 SM121** —— SM90/100/120/121 使用 TMA 描述符内核,SM89(RTX 40 系列)使用指针内核孪生版本。SM121 覆盖 DGX Spark。
 - **调度稀疏** —— 在采样过程中渐变 `tau`(前期稀疏、后期致密),并输出调度曲线预览图。
 - **前馈分块** —— 压低 MiniMax H3 的 MLP 峰值激活显存,输出逐位一致。
 - **诚实回退** —— 内核无法处理的形状或 GPU 自动回退到你原有的注意力后端并记录原因;`strict` 模式则直接抛错,用于验证新环境。
@@ -35,7 +35,7 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 
 ## 前置条件
 
-- NVIDIA GPU:**SM89、SM90、SM100 或 SM120** —— SM90/100/120 运行 TMA 内核路径,SM89(RTX 40 系列)运行指针内核孪生版本。本仓库仅在 SM120 硬件上实测;SM89 路径通过强制分发验证,未在 SM89 GPU 上实测。
+- NVIDIA GPU:**SM89、SM90、SM100、SM120 或 SM121** —— SM90/100/120/121 运行 TMA 内核路径,SM89(RTX 40 系列)运行指针内核孪生版本。本仓库仅在 SM120 硬件上实测;SM121(DGX Spark)由社区 PR #3 启用,共享相同 TMA 路径;SM89 路径通过强制分发验证,未在 SM89 GPU 上实测。
 - 支持 CUDA 与 **bfloat16** 的 PyTorch
 - 带有 `triton.tools.tensor_descriptor`(TMA)的 **Triton** —— 已在 3.6.0 上验证
 - ComfyUI(基于 0.30.0 开发)
@@ -98,6 +98,7 @@ UNETLoader → Sol-Attn → BasicGuider
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。验证新 GPU 或 Triton 版本时开启。 |
 | `thresh_type` | COMBO | `diag` | `diag`(评估默认值)或 `exact` —— 使用二阶矩统计获得更精确的路由阈值,代价是额外预计算。 |
 | `int8_qk` | BOOLEAN | `False` | 将精确注意力路径的 q/k 量化为 int8。实测 16K tokens 以上快 1.2–1.3×,额外数值误差约 1%;8K 时略慢。这是本仓库的新增功能,不属于 NVIDIA 官方源码。 |
+| `int8_pv` | BOOLEAN | `False` | 同时将 P·V 点积量化为 int8(逐 token P、逐通道 V)。需要 `int8_qk`。32K+ tokens 实测比 int8_qk 快约 1.04×;8K–16K 时略慢。精度降至 rel L2 0.014(int8_qk 单独为 0.008)。按需开启。 |
 
 **输出:** `model`(`MODEL`)
 
@@ -121,6 +122,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
+| `int8_pv` | BOOLEAN | `False` | 与节点 1 相同的 int8 P·V 开关。需要 `int8_qk`。 |
 | `sink_conditioning` | COMBO | `exact_kv` | 保持 H3 打包的文本/条件/参考/音频 KV 块精确(约 3% 开销,保护提示词遵循与音画同步)。`exact_kv_and_rows` 同时让这些查询行走完全稠密路径(约 20% 开销)。`off` 关闭。 |
 | `dense_blocks` | STRING | 空 | 保持稠密的 Transformer 块,如 `0-2,-1` 表示前三个与最后一个(负数从末尾计数)。首尾块对近似误差最敏感。留空则全部稀疏化。 |
 
@@ -147,6 +149,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 | `dense_percent` | FLOAT | `0.0` | 在采样的前此比例内保持原版稠密注意力 —— Sol-Attn 论文的配方为 `0.2`。`0` 表示关闭。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
 | `int8_qk` | BOOLEAN | `False` | 与节点 1 相同的 int8 q/k 开关。 |
+| `int8_pv` | BOOLEAN | `False` | 与节点 1 相同的 int8 P·V 开关。需要 `int8_qk`。 |
 | `sink_conditioning` | COMBO | `exact_kv` | 与节点 2 相同的条件汇聚选择。 |
 | `dense_blocks` | STRING | 空 | 与节点 2 相同的稠密块规格。 |
 
@@ -188,16 +191,16 @@ H3 尺寸(B=1,H=56,D=128,bf16),随机张量,autotune 热身后取 20 次迭代�
 | tokens | PyTorch SDPA (ms) | SageAttention (ms) | Sol-Attn 跨步 (ms) | vs Sage | vs SDPA |
 |---:|---:|---:|---:|---:|---:|
 | 2,048 | 1.45 | 0.60 | 0.89 | 0.67× | 1.63× |
-| 8,192 | 23.96 | 3.72 | 3.25 | 1.14× | 7.36× |
-| 16,384 | 84.95 | 13.94 | 10.08 | 1.38× | 8.42× |
-| 32,768 | 352.15 | 55.90 | 38.73 | 1.44× | 9.09× |
-| 65,536 | 1,350.54 | 221.06 | 153.56 | 1.44× | 8.79× |
+| 8,192 | 22.49 | 3.80 | 3.20 | 1.19× | 7.03× |
+| 16,384 | 96.86 | 15.15 | 10.37 | 1.46× | 9.34× |
+| 32,768 | 349.03 | 54.69 | 37.91 | 1.44× | 9.21× |
+| 65,536 | 1,405.18 | 234.51 | 151.63 | 1.55× | 9.27× |
 
 - 2,048 tokens 处的 `0.67× vs Sage` 表示**该长度下 Sage 更快** —— 约 4K tokens 以下 Sage 明显占优。`min_tokens` 默认 4,096;若只想要已实测的赢面,可提高到 8,192。
 - SageAttention 是公平基线。列出 PyTorch SDPA 仅因其他 Sol-Attn 插件引用它 —— 在这些尺寸下它并未使用有竞争力的内核路径。
 - 随机高斯输入是 Sol-Attn 内容相关路由的最差情况,真实提示词应达到或超过这些比值;多次运行间存在几个百分点的波动。
 - 通用节点的 q/k/v 拷贝每次调用额外消耗 0.2–2 ms(视长度而定,见测试输出中的 "Sol generic")。
-- 启用 `int8_qk`(本仓库新增)后,同一跨步路径相对上表 bf16 数据的实测比值为:8,192 处 0.97×、16,384 处 1.30×、32,768 处 1.21×、65,536 处 1.18×,额外数值误差约 1%。
+- 启用 `int8_qk`(本仓库新增)后,同一跨步路径相对上表 bf16 数据的实测比值为:8K 处 1.27×、16K 处 1.27×、32K 处 1.32×、65K 处 1.32×(2.52 / 8.17 / 28.75 / 114.81 ms),额外数值误差约 1%。`int8_pv` 额外量化 P·V —— 按需开启,速度变化微小,精度降至 rel L2 0.014。
 
 全模型参考:一组受控对照(MiniMax H3,15 秒,480×864,20 步,`res_multistep`,固定种子,同一输入图)测得 Sage 9.91 s/it → Sol 8.92 s/it(−10%,使用钩子式节点)。
 
@@ -268,9 +271,9 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 
 - **Sol-Attn 是近似方法。** 输出不会与稠密注意力逐位一致;是否影响画面由你判断 —— 用 `enabled` 做 A/B。
 - **MiniMax H3 不在 Sol-Attn 论文评估范围内。** H3 使用联合打包序列(文本、条件、音频、视频);`sink_conditioning` 选项已实现论文的精确条件 K/V 处理,但首层稠密调度等论文中更保守配方的其余内容未实现。
-- **SM120 支持是本仓库的改动**,而非 NVIDIA 官方。NVIDIA 公开源码的架构门仍只列 SM90/SM100。数值问题请报告到本仓库,不要上报到 NVlabs/Sana。
+- **SM120/SM121 支持是本仓库的改动**,而非 NVIDIA 官方。NVIDIA 公开源码的架构门仍只列 SM90/SM100。SM121(DGX Spark)由社区 PR #3 添加。数值问题请报告到本仓库,不要上报到 NVlabs/Sana。
 - **H3 专用节点绕过了 ComfyUI 的注意力钩子。** 挂在 `optimized_attention_override` 上的其他补丁在 Sol 激活的块上不会运行,注意力相关的 `transformer_options` 补丁也不会在 Sol 路径上应用。
-- **跨步视图 TMA 布局是本仓库在本地验证器副本中放宽的**,仅在 SM120 上实测,并已在非整除序列长度(如 38,247 tokens,真实 H3 尺寸)下验证。SM89 指针内核通过 SM120 上的强制分发验证,未在 SM89 硬件上实测。在新环境上请先以 `strict=true` 跑一次。
+- **跨步视图 TMA 布局是本仓库在本地验证器副本中放宽的**,仅在 SM120 上实测,并已在非整除序列长度(如 38,247 tokens,真实 H3 尺寸)下验证。SM121 使用与 SM120 相同的 TMA 路径,但本仓库未在 SM121 硬件上实测。SM89 指针内核通过 SM120 上的强制分发验证,未在 SM89 硬件上实测。在新环境上请先以 `strict=true` 跑一次。
 - NVIDIA 公布的约 2.0–2.3× 数据面向整个 Sol-Engine(CuTe 内核、NVFP4、块融合、数据中心 GPU)。本包仅为 Triton 参考内核 —— 完全是另一回事。
 - 已评估 [KingGore Blackwell 分支](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell):其 `flex_attention` 路径在 H3 尺寸、8,192 tokens 下为 4.334 ms,本 Triton 参考为 3.256 ms。它使用硬块掩码(未选中的块被丢弃而非近似),属于不同方法;其导入期修改已安装 PyTorch 包内文件的修复手段在此被有意排除。
 

@@ -145,7 +145,7 @@ class _SolLog:
 
 def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict, sol_log,
                                 thresh_type="diag", dense_percent=0.0, progress_fn=None,
-                                int8_qk=False, sink_conditioning="exact_kv"):
+                                int8_qk=False, int8_pv=False, sink_conditioning="exact_kv"):
     """Sol-Attn on the packed NHD views of the fused qkv buffer, no q/k/v copies.
 
     `tau` may be a float or a callable of the current sigma. When `progress_fn`
@@ -203,7 +203,7 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
                 k = attn.k_norm(k)
 
             out = sol_attn(q, k, v, tau=tau(sigma) if callable(tau) else tau,
-                           thresh_type=thresh_type, int8_qk=int8_qk,
+                           thresh_type=thresh_type, int8_qk=int8_qk, int8_pv=int8_pv,
                            sink_blocks=sink_blocks, sink_q=sink_q)
             sol_log.hit(s)
             return attn.out_proj(out.view(s, inner))
@@ -439,6 +439,15 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                         "~1% extra numerical error; slightly slower at 8K.",
                     },
                 ),
+                "int8_pv": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
+                        "per-channel V). More speed on top of int8_qk at additional "
+                        "accuracy cost. Requires int8_qk. Opt-in.",
+                    },
+                ),
                 "sink_conditioning": (
                     ["exact_kv", "exact_kv_and_rows", "off"],
                     {
@@ -472,7 +481,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
         "steps. tau_graph previews the schedule; wire it to a Preview Image node."
     )
 
-    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, sink_conditioning, dense_blocks):
+    def patch(self, model, enabled, tau_start, tau_end, curve, min_tokens, strict, dense_percent, thresh_type, int8_qk, int8_pv, sink_conditioning, dense_blocks):
         graph = _plot_tau_schedule(float(tau_start), float(tau_end), curve, float(dense_percent))
         if not enabled:
             return (model, graph)
@@ -516,7 +525,7 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                 _make_sol_attention_forward(
                     attn, fallback_forward, schedule.tau, int(min_tokens), bool(strict), sol_log,
                     thresh_type, float(dense_percent), schedule.progress, bool(int8_qk),
-                    sink_conditioning,
+                    bool(int8_pv), sink_conditioning,
                 ),
             )
 
@@ -591,6 +600,15 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                         "~1% extra numerical error; slightly slower at 8K.",
                     },
                 ),
+                "int8_pv": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
+                        "per-channel V). More speed on top of int8_qk at additional "
+                        "accuracy cost. Requires int8_qk. Opt-in.",
+                    },
+                ),
                 "sink_conditioning": (
                     ["exact_kv", "exact_kv_and_rows", "off"],
                     {
@@ -624,7 +642,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
         "stock attention forward."
     )
 
-    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, sink_conditioning, dense_blocks):
+    def patch(self, model, enabled, tau, min_tokens, strict, thresh_type, int8_qk, int8_pv, sink_conditioning, dense_blocks):
         if not enabled:
             return (model,)
         if sol_attn is None:
@@ -657,7 +675,7 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                 f"diffusion_model.blocks.{i}.attn.forward",
                 _make_sol_attention_forward(
                     attn, fallback_forward, float(tau), int(min_tokens), bool(strict), sol_log,
-                    thresh_type, int8_qk=bool(int8_qk), sink_conditioning=sink_conditioning,
+                    thresh_type, int8_qk=bool(int8_qk), int8_pv=bool(int8_pv), sink_conditioning=sink_conditioning,
                 ),
             )
 
