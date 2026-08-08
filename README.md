@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.5.5**
+**Version: v0.5.8**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -103,12 +103,12 @@ UNETLoader → Sol-Attn → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | required | The model to patch. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
-| `tau` | FLOAT | `1.0` | Routing threshold in standard deviations above the mean block score. Higher = more KV blocks take the approximate path = faster, lower fidelity. `1.0` is the Sol-Attn default. |
+| `tau` | FLOAT | `1.3` | Routing threshold in standard deviations above the mean block score. Higher = more KV blocks take the approximate path = faster, lower fidelity. `1.0` is the Sol-Attn paper default; `1.3` is the tuned default here. |
 | `min_tokens` | INT | `4096` | Use the normal backend below this sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. Enable while validating a new GPU or Triton version. |
 | `thresh_type` | COMBO | `diag` | `diag` (evaluated default) or `exact` — second-moment statistics for more precise routing at extra precompute cost. |
 | `int8_qk` | BOOLEAN | `False` | Quantize q/k to int8 for the exact attention path. Measured 1.2–1.3× faster above 16K tokens at ~1% extra numerical error; slightly slower at 8K. This is a repository addition, not part of NVIDIA's source. |
-| `int8_pv` | BOOLEAN | `False` | Additionally quantize the P·V dot to int8 (per-token P, per-channel V). Requires `int8_qk`. At 32K+ tokens measures ~1.04× faster than int8_qk alone; slower at 8K–16K. Accuracy drops to 0.014 rel L2 vs bf16 (from 0.008 with int8_qk alone). Opt-in. |
+| `int8_pv` | BOOLEAN | `False` | Additionally quantize the P·V dot to int8 (per-token P, per-channel V). Requires `int8_qk`. Speed is within noise of int8_qk alone on current hardware; accuracy drops to 0.014 rel L2 vs bf16 (from 0.008 with int8_qk alone). Opt-in. |
 
 **Output:** `model` (`MODEL`)
 
@@ -127,7 +127,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | required | A MiniMax H3 model; anything else passes through unchanged with a warning. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
-| `tau` | FLOAT | `1.0` | Same routing threshold as the generic node. |
+| `tau` | FLOAT | `1.3` | Same routing threshold as the generic node. |
 | `min_tokens` | INT | `4096` | Use the stock attention forward below this packed sequence length. |
 | `strict` | BOOLEAN | `False` | Raise kernel errors instead of falling back. |
 | `thresh_type` | COMBO | `diag` | Same estimator choice as node 1. |
@@ -151,7 +151,7 @@ Same zero-copy attention path as node 2, but `tau` ramps across sampling: sparse
 |-----------|------|---------|-------------|
 | `model` | MODEL | required | A MiniMax H3 model. |
 | `enabled` | BOOLEAN | `True` | Flip to `False` to A/B without rewiring. |
-| `tau_start` | FLOAT | `1.25` | tau on the first, highest-noise step. |
+| `tau_start` | FLOAT | `1.3` | tau on the first, highest-noise step. |
 | `tau_end` | FLOAT | `0.8` | tau on the final, low-noise steps. |
 | `curve` | COMBO | `linear` | `linear`, `cosine`, `sqrt`, `smoothstep`, `exponential`, or `step` (hard switch at the midpoint) — how tau interpolates between the two ends. |
 | `min_tokens` | INT | `4096` | Use the stock attention forward below this packed sequence length. |
@@ -268,11 +268,11 @@ ComfyUI ships core **EasyCache**/`LazyCache` nodes (`comfy_extras/nodes_easycach
 ## Console output
 
 ```text
-[Sol-Attn] patched (tau=1.00, min_tokens=8192, strict=False)
+[Sol-Attn] patched (tau=1.30, min_tokens=4096, strict=False)
 [Sol-Attn] active
 [Sol-Attn] dense fallback: <reason>
-[MiniMax H3 Sol] patched 30 attention blocks (tau=1.00, min_tokens=8192, strict=False)
-[MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=4096)
+[MiniMax H3 Sol] patched 30 attention blocks (tau=1.30, min_tokens=4096, strict=False)
+[MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=8192)
 ```
 
 Each distinct fallback reason is logged once per run. Also note the compile tax: Triton autotunes with `key=["T"]`, so the **first run at any new token count pays a JIT sweep inside the sampling loop** — timings are cached to disk, so a given token count pays it only once ever, but change resolution or duration and you pay it again for the new size. Benchmark the second run.

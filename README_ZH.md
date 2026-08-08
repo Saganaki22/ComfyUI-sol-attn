@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.5.5**
+**版本: v0.5.8**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -95,12 +95,12 @@ UNETLoader → Sol-Attn → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | 必填 | 要打补丁的模型。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
-| `tau` | FLOAT | `1.0` | 路由阈值,以块分数均值之上的标准差计。越高 = 越多 KV 块走近似路径 = 更快、保真度更低。`1.0` 为 Sol-Attn 默认值。 |
+| `tau` | FLOAT | `1.3` | 路由阈值,以块分数均值之上的标准差计。越高 = 越多 KV 块走近似路径 = 更快、保真度更低。`1.0` 为 Sol-Attn 论文默认值;`1.3` 为本仓库调优后的默认值。 |
 | `min_tokens` | INT | `4096` | 低于此序列长度时使用常规后端。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。验证新 GPU 或 Triton 版本时开启。 |
 | `thresh_type` | COMBO | `diag` | `diag`(评估默认值)或 `exact` —— 使用二阶矩统计获得更精确的路由阈值,代价是额外预计算。 |
 | `int8_qk` | BOOLEAN | `False` | 将精确注意力路径的 q/k 量化为 int8。实测 16K tokens 以上快 1.2–1.3×,额外数值误差约 1%;8K 时略慢。这是本仓库的新增功能,不属于 NVIDIA 官方源码。 |
-| `int8_pv` | BOOLEAN | `False` | 同时将 P·V 点积量化为 int8(逐 token P、逐通道 V)。需要 `int8_qk`。32K+ tokens 实测比 int8_qk 快约 1.04×;8K–16K 时略慢。精度降至 rel L2 0.014(int8_qk 单独为 0.008)。按需开启。 |
+| `int8_pv` | BOOLEAN | `False` | 同时将 P·V 点积量化为 int8(逐 token P、逐通道 V)。需要 `int8_qk`。当前硬件上速度与 int8_qk 基本持平;精度降至 rel L2 0.014(int8_qk 单独为 0.008)。按需开启。 |
 
 **输出:** `model`(`MODEL`)
 
@@ -119,7 +119,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | 必填 | MiniMax H3 模型;其他模型将警告并原样返回。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
-| `tau` | FLOAT | `1.0` | 与通用节点相同的路由阈值。 |
+| `tau` | FLOAT | `1.3` | 与通用节点相同的路由阈值。 |
 | `min_tokens` | INT | `4096` | 低于此打包序列长度时使用原版注意力 forward。 |
 | `strict` | BOOLEAN | `False` | 内核报错时抛出而非回退。 |
 | `thresh_type` | COMBO | `diag` | 与节点 1 相同的估计器选择。 |
@@ -143,7 +143,7 @@ UNETLoader → MiniMax H3 Memory Efficient Sol Attention Patch → BasicGuider
 |-----------|------|---------|-------------|
 | `model` | MODEL | 必填 | MiniMax H3 模型。 |
 | `enabled` | BOOLEAN | `True` | 设为 `False` 可在不改线的情况下 A/B 对比。 |
-| `tau_start` | FLOAT | `1.25` | 第一步(噪声最高)时的 tau。 |
+| `tau_start` | FLOAT | `1.3` | 第一步(噪声最高)时的 tau。 |
 | `tau_end` | FLOAT | `0.8` | 最后几步(低噪声)时的 tau。 |
 | `curve` | COMBO | `linear` | `linear`、`cosine`、`sqrt`、`smoothstep`、`exponential` 或 `step`(中点硬切换)—— 两端之间的插值方式。 |
 | `min_tokens` | INT | `4096` | 低于此打包序列长度时使用原版注意力 forward。 |
@@ -260,11 +260,11 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 ## 控制台输出
 
 ```text
-[Sol-Attn] patched (tau=1.00, min_tokens=8192, strict=False)
+[Sol-Attn] patched (tau=1.30, min_tokens=4096, strict=False)
 [Sol-Attn] active
 [Sol-Attn] dense fallback: <reason>
-[MiniMax H3 Sol] patched 30 attention blocks (tau=1.00, min_tokens=8192, strict=False)
-[MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=4096)
+[MiniMax H3 Sol] patched 30 attention blocks (tau=1.30, min_tokens=4096, strict=False)
+[MiniMax H3 FFN] patched 62 MLPs (chunks=2, min_tokens=8192)
 ```
 
 每种回退原因每次运行只记录一次。另请注意编译开销:Triton 以 `key=["T"]` 做 autotune,**每个新 token 数的首次运行都会在采样循环内支付一次 JIT 扫描** —— 计时结果会缓存到磁盘,因此同一 token 数全局只付一次,但改分辨率或时长后新尺寸仍需再付一次。请在第二次运行时测量。

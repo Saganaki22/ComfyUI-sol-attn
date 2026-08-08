@@ -124,13 +124,13 @@ class SolAttentionPatch:
                 "tau": (
                     "FLOAT",
                     {
-                        "default": 1.0,
+                        "default": 1.3,
                         "min": 0.0,
                         "max": 4.0,
                         "step": 0.05,
                         "tooltip": "Routing threshold. Higher = more blocks take "
                         "the approximate path = faster, lower fidelity. "
-                        "1.0 is the Sol-Attn default.",
+                        "1.0 is the Sol-Attn paper default; 1.3 is tuned here.",
                     },
                 ),
                 "min_tokens": (
@@ -175,8 +175,8 @@ class SolAttentionPatch:
                     {
                         "default": False,
                         "tooltip": "Also quantize the P*V dot to int8 (per-token P, "
-                        "per-channel V). More speed on top of int8_qk at additional "
-                        "accuracy cost. Requires int8_qk. Opt-in.",
+                        "per-channel V). Speed is within noise of int8_qk alone; "
+                        "accuracy drops to 0.014 rel L2. Requires int8_qk. Opt-in.",
                     },
                 ),
             }
