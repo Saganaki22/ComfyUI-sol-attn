@@ -364,24 +364,30 @@ def _forward_int8(
             block_max = tl.max(exact_scores, axis=1)
             new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
-            exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
-            row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
             if INT8_PV:
                 # P is non-negative with a known per-row max; its scale and
                 # V's per-channel scale both factor out of the int32 dot.
+                # Exponentiating against the block max instead of the running max
+                # lands P in [0, 1], which is exactly the range the INT8
+                # quantization wants -- so the softmax rescale and the quant scale
+                # are the same constant and P is never materialized twice.
                 vi = tl.load(
                     vi_ptr + ((batch * T + k_rows[:, None]) * H + head) * D
                     + bv_offsets[None, :],
                     mask=(k_rows < T)[:, None],
                     other=0,
                 )
-                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
-                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pe = tl.math.exp2(exact_scores - block_max[:, None])
+                beta = tl.math.exp2(block_max - new_max)
+                row_sum = row_sum * alpha + beta * tl.sum(pe, axis=1)
+                pi = tl.minimum(pe * 127.0 + 0.5, 127.0).to(tl.int8)
                 pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
-                    p_scale[:, None] * v_scale[None, :]
+                    (beta * (1.0 / 127.0))[:, None] * v_scale[None, :]
                 )
                 output = output * alpha[:, None] + pv
             else:
+                exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
+                row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
                 vb = tl.load(
                     v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t
                     + head * sv_h + bv_offsets[None, :],
@@ -666,22 +672,29 @@ def _forward_int8_ptr(
             block_max = tl.max(exact_scores, axis=1)
             new_max = tl.maximum(row_max, block_max)
             alpha = tl.math.exp2(row_max - new_max)
-            exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
-            row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
             if INT8_PV:
+                # see _forward_int8 for why both scales factor out of the dot.
+                # Exponentiating against the block max instead of the running max
+                # lands P in [0, 1], which is exactly what the INT8 quantization
+                # wants -- so the softmax rescale and the quant scale are the same
+                # constant, and P never has to be materialized at running-max scale.
                 vi = tl.load(
                     vi_ptr + ((batch * T + k_rows[:, None]) * H + head) * D
                     + bv_offsets[None, :],
                     mask=k_valid[:, None],
                     other=0,
                 )
-                p_scale = tl.maximum(tl.math.exp2(block_max - new_max), 1e-30) / 127.0
-                pi = tl.minimum(exact_probability / p_scale[:, None] + 0.5, 127.0).to(tl.int8)
+                pe = tl.math.exp2(exact_scores - block_max[:, None])
+                beta = tl.math.exp2(block_max - new_max)
+                row_sum = row_sum * alpha + beta * tl.sum(pe, axis=1)
+                pi = tl.minimum(pe * 127.0 + 0.5, 127.0).to(tl.int8)
                 pv = tl.dot(pi, vi, out_dtype=tl.int32).to(tl.float32) * (
-                    p_scale[:, None] * v_scale[None, :]
+                    (beta * (1.0 / 127.0))[:, None] * v_scale[None, :]
                 )
                 output = output * alpha[:, None] + pv
             else:
+                exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
+                row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
                 vb = tl.load(
                     v_ptr + batch * sv_b + k_rows[:, None].to(tl.int64) * sv_t + head * sv_h + bv_offsets[None, :],
                     mask=k_valid[:, None],
@@ -731,13 +744,16 @@ def sol_attn(
     if arch[0] < 9:
         # SM89 pointer path: masked loads, q/k/v keep their strides.
         if int8_qk:
-            kc, vc, threshold, q8, q_scale, k8, k_scale = prepare(
-                q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True
-            )
             if int8_pv:
                 from .quant import quantize_v_per_channel
-                vi, v_scale = quantize_v_per_channel(v)
+                kc, vc, threshold, q8, q_scale, k8, k_scale, v_absmax = prepare(
+                    q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True, int8_pv=True
+                )
+                vi, v_scale = quantize_v_per_channel(v, absmax=v_absmax)
             else:
+                kc, vc, threshold, q8, q_scale, k8, k_scale = prepare(
+                    q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True
+                )
                 vi, v_scale = q8, q_scale  # unused dummies
             _forward_int8_ptr[(1, blocks, batch * heads)](
                 q, v, kc, vc, q8, k8, q_scale, k_scale,
@@ -777,13 +793,16 @@ def sol_attn(
     block_shape = [1, BLOCK, 1, head_dim]
     summary_shape = [1, GROUP, 1, head_dim]
     if int8_qk:
-        kc, vc, threshold, q8, q_scale, k8, k_scale = prepare(
-            q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True
-        )
         if int8_pv:
             from .quant import quantize_v_per_channel
-            vi, v_scale = quantize_v_per_channel(v)
+            kc, vc, threshold, q8, q_scale, k8, k_scale, v_absmax = prepare(
+                q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True, int8_pv=True
+            )
+            vi, v_scale = quantize_v_per_channel(v, absmax=v_absmax)
         else:
+            kc, vc, threshold, q8, q_scale, k8, k_scale = prepare(
+                q, k, v, scale=scale, tau=tau, thresh_type=thresh_type, int8_qk=True
+            )
             vi, v_scale = q8, q_scale  # unused dummies
         _forward_int8[(1, blocks, batch * heads)](
             TensorDescriptor.from_tensor(q, block_shape),

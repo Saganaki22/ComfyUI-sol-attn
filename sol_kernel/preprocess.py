@@ -57,6 +57,7 @@ def _reduce_kc_kernel(
 def _reduce_vc_kernel(
     v_ptr,
     vc,
+    vamax,
     T,
     s_b, s_t, s_h,
     H: tl.constexpr,
@@ -64,6 +65,7 @@ def _reduce_vc_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     TILE_D: tl.constexpr,
+    WRITE_AMAX: tl.constexpr,
 ):
     d_tile, block, batch_head = (
         tl.program_id(0),
@@ -84,6 +86,14 @@ def _reduce_vc_kernel(
         summary,
         mask=offsets < D,
     )
+    if WRITE_AMAX:
+        # Per-block half of the per-channel |V| max, from the load this kernel
+        # already does. Masked rows read 0.0, which can never raise a max.
+        tl.store(
+            vamax + ((batch * N + block) * H + head) * D + offsets,
+            tl.max(tl.abs(values.to(tl.float32)), axis=0),
+            mask=offsets < D,
+        )
 
 
 @triton.jit
@@ -278,7 +288,8 @@ def _exact_fused_threshold_kernel(
 def _reduce_kv(
     k: torch.Tensor,
     v: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    v_absmax: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, tokens, heads, head_dim = k.shape
     blocks = triton.cdiv(tokens, BLOCK_SIZE)
     tile_d = min(128, triton.next_power_of_2(head_dim))
@@ -301,9 +312,14 @@ def _reduce_kv(
         tile_d,
         num_warps=4,
     )
+    amax_partial = (
+        torch.empty((batch, blocks, heads, head_dim), device=v.device, dtype=torch.float32)
+        if v_absmax else None
+    )
     _reduce_vc_kernel[grid](
         v,
         vc,
+        amax_partial if v_absmax else vc,
         tokens,
         v.stride(0), v.stride(1), v.stride(2),
         heads,
@@ -311,8 +327,12 @@ def _reduce_kv(
         head_dim,
         BLOCK_SIZE,
         tile_d,
+        v_absmax,
         num_warps=4,
     )
+    if v_absmax:
+        # [B, blocks, H, D] -> [B, H, D]; blocks is small, so torch is fine here.
+        return kc, vc, amax_partial.amax(dim=1)
     return kc, vc
 
 
@@ -434,8 +454,14 @@ def prepare(
     scale: float,
     thresh_type: str = "diag",
     int8_qk: bool = False,
+    int8_pv: bool = False,
 ) -> tuple:
-    kc, vc = _reduce_kv(k, v)
+    if int8_pv and not int8_qk:
+        raise ValueError("int8_pv requires int8_qk")
+    if int8_pv:
+        kc, vc, v_absmax = _reduce_kv(k, v, v_absmax=True)
+    else:
+        kc, vc = _reduce_kv(k, v)
     if not int8_qk:
         if thresh_type == "exact":
             threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
@@ -453,6 +479,8 @@ def prepare(
     qi, qs, threshold = quantize_q_with_threshold(q, stat_mean, stat_var, scale=scale, tau=tau)
     if thresh_type == "exact":
         threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
+    if int8_pv:
+        return kc, vc, threshold, qi, qs, ki, ks, v_absmax
     return kc, vc, threshold, qi, qs, ki, ks
 
 

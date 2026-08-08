@@ -194,14 +194,19 @@ def _quantize_v_kernel(
     )
 
 
-def quantize_v_per_channel(v, rows=16):
+def quantize_v_per_channel(v, rows=16, absmax=None):
     """v [B, T, H, D] bf16. Returns v_int8 [B, T, H, D], v_scale [B*H, D] fp32.
 
     PV is out[m,d] = sum_k P[m,k] V[k,d], so a per-channel V scale and a
     per-row P scale both factor straight out of the int32 dot.
+
+    ``absmax`` is V's per-(head, channel) |max| as [B, H, D]. Pass it in from a
+    pass that already reads V; computing it here costs an extra full read.
     """
     batch, tokens, heads, head_dim = v.shape
-    scale = v.abs().amax(dim=1).float().div_(127.0).clamp_min_(1e-8)
+    if absmax is None:
+        absmax = v.abs().amax(dim=1)
+    scale = absmax.float().div(127.0).clamp_min_(1e-8)
     scale = scale.reshape(batch * heads, head_dim).contiguous()
     vi = torch.empty(v.shape, device=v.device, dtype=torch.int8)
     _quantize_v_kernel[(triton.cdiv(tokens, rows), batch * heads)](
