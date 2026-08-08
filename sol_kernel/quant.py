@@ -23,6 +23,60 @@ def _round_to_int8(x):
 
 
 @triton.jit
+def _reduce_quant_k_kernel(
+    k_ptr,
+    kc_ptr,
+    k8_ptr,
+    k_scale,
+    T,
+    s_b, s_t, s_h,
+    H: tl.constexpr,
+    NB,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WRITE_QUANT: tl.constexpr,
+):
+    """Fused block-mean reduce + residual int8 quantization: one K read.
+
+    The block sum is accumulated in fp32 so the result is independent of the
+    compiler-chosen reduction order (fp32 order noise rounds away at bf16
+    storage). Both the bf16 and int8 paths obtain kc from this kernel, so
+    routing decisions agree between them. With WRITE_QUANT=False the quant
+    half is dead-code-eliminated and only kc is produced.
+    """
+    block, batch_head = tl.program_id(0), tl.program_id(1)
+    batch, head = batch_head // H, batch_head % H
+    block_len = tl.minimum(BLOCK, T - block * BLOCK)
+    rows = block * BLOCK + tl.arange(0, BLOCK)
+    d = tl.arange(0, D)
+    valid = rows < T
+    tile = tl.load(
+        k_ptr + batch * s_b + rows[:, None].to(tl.int64) * s_t + head * s_h + d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    summary = tl.sum(tile.to(tl.float32), axis=0) / block_len
+    tl.store(
+        kc_ptr + ((batch * NB + block) * H + head) * D + d,
+        summary,
+    )
+    if WRITE_QUANT:
+        # The residual is computed against the mean AFTER it has been rounded
+        # to bf16 storage precision, replicating store-then-load.
+        mean_stored = summary.to(tl.bfloat16).to(tl.float32)
+        centered = tl.where(valid[:, None], tile.to(tl.float32) - mean_stored[None, :], 0.0)
+        amax = tl.max(tl.abs(centered), axis=1)
+        scale = tl.maximum(amax / 127.0, 1e-8)
+        k8 = _round_to_int8(centered / scale[:, None])
+        tl.store(
+            k8_ptr + ((batch * T + rows[:, None]) * H + head) * D + d[None, :],
+            k8,
+            mask=valid[:, None],
+        )
+        tl.store(k_scale + (batch * T + rows) * H + head, scale, mask=valid)
+
+
+@triton.jit
 def _quantize_k_kernel(
     k_ptr,
     kc_ptr,
@@ -133,6 +187,38 @@ def quantize_k(k, kc):
     return k8, k_scale
 
 
+def reduce_quantize_k(k, quant=True):
+    """Fused block-mean reduce + residual int8 quantization; one K read.
+
+    k [B, T, H, D] bf16. With quant=True returns (kc, k_int8, k_scale); with
+    quant=False returns (kc, None, None) — the kc producer for the bf16 path,
+    so routing decisions agree between the bf16 and int8 paths.
+    """
+    batch, tokens, heads, head_dim = k.shape
+    blocks = triton.cdiv(tokens, BLOCK_SIZE)
+    kc = torch.empty((batch, blocks, heads, head_dim), device=k.device, dtype=torch.bfloat16)
+    k8 = torch.empty(k.shape, device=k.device, dtype=torch.int8) if quant else kc
+    k_scale = (
+        torch.empty((batch, tokens, heads), device=k.device, dtype=torch.float32)
+        if quant else kc
+    )
+    _reduce_quant_k_kernel[(blocks, batch * heads)](
+        k,
+        kc,
+        k8,
+        k_scale,
+        tokens,
+        k.stride(0), k.stride(1), k.stride(2),
+        heads,
+        blocks,
+        head_dim,
+        BLOCK_SIZE,
+        quant,
+        num_warps=4,
+    )
+    return kc, k8, k_scale
+
+
 def quantize_q_with_threshold(q, kc_mean, kc_var, *, scale, tau):
     """q [B, T, H, D] bf16; kc stats [B, H, D] fp32 on the smoothed summaries.
 
@@ -223,4 +309,4 @@ def quantize_v_per_channel(v, rows=16, absmax=None):
     return vi, scale
 
 
-__all__ = ["quantize_k", "quantize_q_with_threshold", "quantize_v_per_channel"]
+__all__ = ["quantize_k", "reduce_quantize_k", "quantize_q_with_threshold", "quantize_v_per_channel"]

@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .quant import quantize_k, quantize_q_with_threshold
+from .quant import quantize_k, reduce_quantize_k, quantize_q_with_threshold
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -45,7 +45,9 @@ def _reduce_kc_kernel(
         mask=(rows < T)[:, None] & (offsets < D)[None, :],
         other=0.0,
     )
-    summary = tl.sum(values, axis=0) / block_len
+    # fp32 accumulation: order-independent, so this agrees with the fused
+    # reduce+quantize kernel regardless of compiler-chosen reduction layout.
+    summary = tl.sum(values.to(tl.float32), axis=0) / block_len
     tl.store(
         kc + ((batch * N + block) * H + head) * D + offsets,
         summary,
@@ -336,6 +338,44 @@ def _reduce_kv(
     return kc, vc
 
 
+def _reduce_v(
+    v: torch.Tensor,
+    v_absmax: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """V-only variant of _reduce_kv for the fused int8 path, where K's reduce
+    is fused with its quantization."""
+    batch, tokens, heads, head_dim = v.shape
+    blocks = triton.cdiv(tokens, BLOCK_SIZE)
+    tile_d = min(128, triton.next_power_of_2(head_dim))
+    vc = torch.empty(
+        (batch, blocks, heads, head_dim),
+        device=v.device,
+        dtype=torch.bfloat16,
+    )
+    grid = (triton.cdiv(head_dim, tile_d), blocks, batch * heads)
+    amax_partial = (
+        torch.empty((batch, blocks, heads, head_dim), device=v.device, dtype=torch.float32)
+        if v_absmax else None
+    )
+    _reduce_vc_kernel[grid](
+        v,
+        vc,
+        amax_partial if v_absmax else vc,
+        tokens,
+        v.stride(0), v.stride(1), v.stride(2),
+        heads,
+        blocks,
+        head_dim,
+        BLOCK_SIZE,
+        tile_d,
+        v_absmax,
+        num_warps=4,
+    )
+    if v_absmax:
+        return vc, amax_partial.amax(dim=1)
+    return vc
+
+
 def _compute_diag_threshold(
     q: torch.Tensor,
     kc: torch.Tensor,
@@ -458,21 +498,26 @@ def prepare(
 ) -> tuple:
     if int8_pv and not int8_qk:
         raise ValueError("int8_pv requires int8_qk")
-    if int8_pv:
-        kc, vc, v_absmax = _reduce_kv(k, v, v_absmax=True)
-    else:
-        kc, vc = _reduce_kv(k, v)
     if not int8_qk:
+        # kc comes from the same fused kernel the int8 path uses (quant half
+        # compiled out), so routing decisions agree between the two paths.
+        kc, _, _ = reduce_quantize_k(k, quant=False)
+        vc = _reduce_v(v)
         if thresh_type == "exact":
             threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
         else:
             threshold = _compute_diag_threshold(q, kc, tau=tau, scale=scale)
         return kc, vc, threshold
 
-    # int8 path: quantize the per-block-mean residual of k per token (the mean
-    # term is the routing score the forward computes exactly in bf16), and fuse
-    # the q quantization with the diag threshold so q is read once.
-    ki, ks = quantize_k(k, kc)
+    # int8 path: K's block-mean reduce and residual quantization are fused into
+    # one kernel (K read once); the mean term is the routing score the forward
+    # computes exactly in bf16, and the q quantization is fused with the diag
+    # threshold so q is read once.
+    kc, ki, ks = reduce_quantize_k(k)
+    if int8_pv:
+        vc, v_absmax = _reduce_v(v, v_absmax=True)
+    else:
+        vc = _reduce_v(v)
     kv = kc.float().permute(0, 2, 1, 3)  # [B, H, NB, D]
     stat_mean = kv.mean(dim=2).contiguous()
     stat_var = (kv - stat_mean.unsqueeze(2)).pow(2).mean(dim=2).contiguous()
