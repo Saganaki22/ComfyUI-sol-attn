@@ -5,7 +5,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.5.8**
+**Version: v0.5.9**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -15,6 +15,12 @@
 Sparse attention and memory patches for video diffusion in ComfyUI, built around NVIDIA's **Sol-Attn** Triton reference kernel — running on consumer Blackwell (SM120 / RTX 50-series), which NVIDIA's public dispatcher does not enable. Ships a generic per-model Sol-Attn patch plus three MiniMax H3-specific nodes for copy-free attention, scheduled sparsity, and feed-forward peak-memory reduction.
 
 > Legal note: the kernel in `sol_kernel/` is vendored NVIDIA source (Apache-2.0), modified locally. The SM120 enablement is this repository's change, not NVIDIA's.
+
+## v0.5.9
+
+- **Faster residual-int8 preprocessing** — K's 64-token block-mean reduction and residual quantization now run in one Triton kernel with one read of K. On an RTX 5090, the isolated K/V-summary + K-quant preprocessing segment measured 26–36% faster at 8K, 16K, and 65K tokens (the 32K result was noisier). The residual-int8 formulation and FP32 accumulation are unchanged; validation found no routing changes.
+- **All supported architectures keep their forward path** — this is a shared preprocessing optimization. SM89 still uses the pointer forward kernels; SM90/100/120/121 still use the TMA forward kernels. No architecture dispatch was changed.
+- **KJNodes composition is documented explicitly** — for the three-patch MiniMax H3 stack, apply global KJ Sage first, KJ's MiniMax memory-efficient Sage patch second, and this repository's MiniMax Sol patch last. Tokens that Sol declines use the captured memory-efficient Sage forward; attention calls outside that H3 object patch continue to use the global Sage override.
 
 ## Why this repo
 
@@ -77,7 +83,8 @@ Where each node sits in a MiniMax H3 workflow:
 
 ```text
 UNETLoader → (LoRA / other model patches)
-          → Patch Sage Attention (KJNodes, optional — sets sage as the fallback backend)
+          → Patch Sage Attention (KJNodes, optional global fallback)
+          → MiniMax H3 Memory Efficient Sage Attention Patch (KJNodes, optional H3 fallback)
           → MiniMax H3 Scheduled Sol Attention Patch   (or the Memory Efficient one)
           → MiniMax H3 Chunk FeedForward
           → EasyCache (optional, core node)
@@ -85,7 +92,8 @@ UNETLoader → (LoRA / other model patches)
 ```
 
 - **The two H3 attention nodes are alternatives — never both.** The scheduled node is a superset of the memory-efficient one (set `tau_start = tau_end` to make them identical).
-- **Sage composes in front, not behind.** KJNodes' `Patch Sage Attention` only swaps the backend, so anything our node declines (early dense steps, short sequences, ineligible shapes) runs sage through the stock forward. Applied after our node it would do nothing. For the zero-copy variant: KJNodes' `MiniMax H3 Memory Efficient Sage Attention Patch` applied **before** our node is adopted as the fallback forward; applied after, it shadows our node entirely.
+- **For all three attention patches, order is mandatory:** `Patch Sage Attention (KJNodes) → MiniMax H3 Memory Efficient Sage Attention Patch (KJNodes) → MiniMax H3 Sol patch (this repo)`. Our H3 wrapper captures the already-patched memory-efficient Sage forward and uses it for short sequences, gated steps, unsupported shapes, and non-strict kernel failures. Other attention calls use KJNodes' global Sage override. Putting the H3 Sage patch after Sol shadows Sol entirely.
+- **The generic `SolAttentionPatch` is not a substitute for the MiniMax-specific Sol node in this stack.** KJNodes' MiniMax memory-efficient Sage patch replaces each H3 attention module's `forward` directly, bypassing the global attention override that the generic node uses.
 - For non-H3 models use the generic `SolAttentionPatch` instead: `UNETLoader → Sol-Attn → guider`.
 
 ## Nodes

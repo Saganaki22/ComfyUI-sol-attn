@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.5.8**
+**版本: v0.5.9**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -12,6 +12,12 @@
 ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVIDIA 的 **Sol-Attn** Triton 参考内核构建 —— 可在消费级 Blackwell(SM120 / RTX 50 系列)上运行,而 NVIDIA 官方调度器并未启用该架构。包含一个通用的逐模型 Sol-Attn 补丁,以及三个 MiniMax H3 专用节点:零拷贝注意力、调度稀疏和前馈峰值显存削减。
 
 > 法律说明:`sol_kernel/` 中的内核为 NVIDIA 源代码(Apache-2.0)的本地修改副本。SM120 的启用是本仓库的改动,而非 NVIDIA 官方行为。
+
+## v0.5.9
+
+- **更快的残差 int8 预处理** —— K 的 64-token 块均值归约与残差量化现已合并到单个 Triton 内核中,只读取一次 K。在 RTX 5090 上,独立的 K/V 汇总 + K 量化预处理阶段于 8K、16K、65K tokens 实测提速 26–36%(32K 结果波动较大)。残差 int8 公式与 FP32 累加方式不变;验证中未发现路由变化。
+- **所有受支持架构保持原有 forward 路径** —— 这是共享预处理优化。SM89 仍使用指针 forward 内核;SM90/100/120/121 仍使用 TMA forward 内核。架构分发逻辑未改动。
+- **明确记录 KJNodes 组合方式** —— MiniMax H3 三补丁组合必须依次应用全局 KJ Sage、KJ 的 MiniMax 显存高效 Sage 补丁,最后应用本仓库的 MiniMax Sol 补丁。Sol 拒绝处理的 tokens 使用已捕获的显存高效 Sage forward;该 H3 对象补丁之外的注意力调用继续使用全局 Sage 覆盖。
 
 ## 为什么选择本仓库
 
@@ -69,7 +75,8 @@ Sol-Attn 运行时约束:`head_dim` 必须恰好为 128、bf16、无注意力掩
 
 ```text
 UNETLoader → (LoRA / 其他模型补丁)
-          → Patch Sage Attention(KJNodes,可选 —— 将 sage 设为回退后端)
+          → Patch Sage Attention(KJNodes,可选的全局回退)
+          → MiniMax H3 Memory Efficient Sage Attention Patch(KJNodes,可选的 H3 回退)
           → MiniMax H3 Scheduled Sol Attention Patch(或 Memory Efficient 版)
           → MiniMax H3 Chunk FeedForward
           → EasyCache(可选,核心节点)
@@ -77,7 +84,8 @@ UNETLoader → (LoRA / 其他模型补丁)
 ```
 
 - **两个 H3 注意力节点二选一,切勿同时使用。** 调度节点是显存高效节点的超集(`tau_start = tau_end` 时两者完全等价)。
-- **sage 只能接在前,不能接在后。** KJNodes 的 `Patch Sage Attention` 只是切换后端,因此本节点拒绝处理的步骤(早期稠密步、短序列、不合规形状)会经原版 forward 落到 sage。若放在本节点之后则不起作用。零拷贝变体的用法:将 KJNodes 的 `MiniMax H3 Memory Efficient Sage Attention Patch` 放在本节点**之前**,它会被采纳为回退 forward;放在之后则会完全覆盖本节点。
+- **同时使用三个注意力补丁时,顺序必须为:**`Patch Sage Attention (KJNodes) → MiniMax H3 Memory Efficient Sage Attention Patch (KJNodes) → MiniMax H3 Sol 补丁(本仓库)`。本仓库的 H3 包装器会捕获已打补丁的显存高效 Sage forward,并在短序列、门控步骤、不支持的形状和非严格模式内核失败时使用它。其他注意力调用使用 KJNodes 的全局 Sage 覆盖。若把 H3 Sage 补丁放在 Sol 之后,它会完全覆盖 Sol。
+- **在此组合中,通用 `SolAttentionPatch` 不能替代 MiniMax 专用 Sol 节点。** KJNodes 的 MiniMax 显存高效 Sage 补丁会直接替换各 H3 注意力模块的 `forward`,绕过通用节点使用的全局注意力覆盖。
 - 非 H3 模型请改用通用的 `SolAttentionPatch`:`UNETLoader → Sol-Attn → guider`。
 
 ## 节点
