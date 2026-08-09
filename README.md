@@ -1,6 +1,7 @@
 # ComfyUI-sol-attn
 
-<img width="1123" height="853" alt="Screenshot 2026-08-03 200716" src="https://github.com/user-attachments/assets/43b7626f-5a9b-48d7-990a-462a5ad13a82" />
+<img width="1103" height="1085" alt="image" src="https://github.com/user-attachments/assets/00612c2c-aba0-4806-adca-bd58ec15b9dc" />
+
 
 
 **English** | **[中文](./README_ZH.md)**
