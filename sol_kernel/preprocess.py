@@ -1,9 +1,9 @@
-"""Block summaries and routing thresholds shared by both CuTe kernels.
+"""Block summaries and routing thresholds shared by all forward kernels.
 
 Loads use plain pointers with explicit strides: TensorDescriptor emulation on
 pre-Hopper arches costs several times more, while on Hopper and newer the
 difference is negligible for these small streaming kernels. The compute-heavy
-forward kernels keep native TMA descriptors on SM90+.
+forward uses pointers on SM89/SM120 and TMA descriptors on SM90/SM100/SM121.
 """
 
 from __future__ import annotations
@@ -485,6 +485,42 @@ def _compute_exact_threshold(
     return global_threshold
 
 
+def _int8_kv_components(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    int8_pv: bool = False,
+) -> tuple:
+    """Prepare the K/V side of residual-INT8 attention without reading Q.
+
+    Keeping this separate lets pointer forward kernels quantize the Q tile and
+    derive its diagonal routing threshold from the Q values they already load.
+    The statistics deliberately use the same torch operations as the original
+    materialized-Q path so its routing arithmetic remains the reference.
+    """
+    kc, ki, ks = reduce_quantize_k(k)
+    if int8_pv:
+        vc, v_absmax = _reduce_v(v, v_absmax=True)
+    else:
+        vc = _reduce_v(v)
+    kv = kc.float().permute(0, 2, 1, 3)  # [B, H, NB, D]
+    stat_mean = kv.mean(dim=2).contiguous()
+    stat_var = (kv - stat_mean.unsqueeze(2)).pow(2).mean(dim=2).contiguous()
+    if int8_pv:
+        return kc, vc, stat_mean, stat_var, ki, ks, v_absmax
+    return kc, vc, stat_mean, stat_var, ki, ks
+
+
+def prepare_int8_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    int8_pv: bool = False,
+) -> tuple:
+    """Public-to-this-package K/V-only preparation for inline-Q kernels."""
+    return _int8_kv_components(k, v, int8_pv=int8_pv)
+
+
 def prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -513,14 +549,11 @@ def prepare(
     # one kernel (K read once); the mean term is the routing score the forward
     # computes exactly in bf16, and the q quantization is fused with the diag
     # threshold so q is read once.
-    kc, ki, ks = reduce_quantize_k(k)
+    components = _int8_kv_components(k, v, int8_pv=int8_pv)
     if int8_pv:
-        vc, v_absmax = _reduce_v(v, v_absmax=True)
+        kc, vc, stat_mean, stat_var, ki, ks, v_absmax = components
     else:
-        vc = _reduce_v(v)
-    kv = kc.float().permute(0, 2, 1, 3)  # [B, H, NB, D]
-    stat_mean = kv.mean(dim=2).contiguous()
-    stat_var = (kv - stat_mean.unsqueeze(2)).pow(2).mean(dim=2).contiguous()
+        kc, vc, stat_mean, stat_var, ki, ks = components
     qi, qs, threshold = quantize_q_with_threshold(q, stat_mean, stat_var, scale=scale, tau=tau)
     if thresh_type == "exact":
         threshold = _compute_exact_threshold(q, kc, tau=tau, scale=scale)
@@ -529,4 +562,4 @@ def prepare(
     return kc, vc, threshold, qi, qs, ki, ks
 
 
-__all__ = ["prepare"]
+__all__ = ["prepare", "prepare_int8_kv"]

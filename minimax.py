@@ -123,6 +123,198 @@ class MiniMaxH3ChunkFeedForward:
         return (patched,)
 
 
+class _FusionUnsupported(Exception):
+    pass
+
+
+class _FusionLog:
+    def __init__(self):
+        self.active = False
+        self.fallbacks = set()
+
+    def hit(self, tokens, segments):
+        if not self.active:
+            log.info(
+                "[MiniMax H3 fusion] active (%d tokens, %d modulation segments)",
+                tokens,
+                segments,
+            )
+            self.active = True
+
+    def miss(self, reason):
+        if reason not in self.fallbacks:
+            self.fallbacks.add(reason)
+            log.info("[MiniMax H3 fusion] eager fallback: %s", reason)
+
+
+class _SegmentIndexCache:
+    """One request-layout lookup shared by all 50 patched H3 blocks."""
+
+    def __init__(self, make_segment_index):
+        self.make_segment_index = make_segment_index
+        self.key = None
+        self.value = None
+
+    def get(self, tokens, segments, device, table_rows):
+        normalized = tuple((int(a), int(b), int(row)) for a, b, row in segments)
+        if not normalized or max(row for _, _, row in normalized) >= int(table_rows):
+            raise ValueError("modulation segment references a missing AdaLN row")
+        key = (str(device), int(tokens), normalized)
+        if key != self.key:
+            self.value = self.make_segment_index(tokens, normalized, device)
+            self.key = key
+        return self.value
+
+
+def _make_fused_h3_block_forward(
+    block,
+    fallback_forward,
+    index_cache,
+    fusion_log,
+    fused_modulate,
+    fused_gate_add,
+):
+    """Replace only H3's modulation/residual elementwise work.
+
+    Attention and MLP calls are resolved from ``block`` at execution time, so
+    object patches installed by KJNodes, the local Sol nodes, or the FFN chunk
+    node continue to compose regardless of node order.
+    """
+
+    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+        try:
+            if (
+                x.ndim != 2
+                or x.dtype != torch.bfloat16
+                or x.device.type != "cuda"
+                or x.requires_grad
+            ):
+                raise _FusionUnsupported("requires a non-autograd CUDA BF16 [tokens, hidden] activation")
+
+            mods = block.adaln_proj(t_emb)
+            if len(mods) != 6:
+                raise _FusionUnsupported("expected six H3 AdaLN modulation tables")
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods
+            table_rows = min(int(table.shape[0]) for table in mods)
+            row_index = index_cache.get(x.shape[0], mod_segments, x.device, table_rows)
+
+            # Everything up to the first residual update leaves x untouched;
+            # an eligibility/kernel failure here can safely use eager forward.
+            h = fused_modulate(block.norm1(x), shift_msa, scale_msa, row_index)
+        except _FusionUnsupported as exc:
+            fusion_log.miss(str(exc))
+            return fallback_forward(
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=transformer_options,
+            )
+        except Exception as exc:
+            # x is still pristine, so a backend/compiler incompatibility can
+            # safely fall back. After the first gate below, exceptions must
+            # propagate because eager retry would consume a modified residual.
+            fusion_log.miss(f"{type(exc).__name__}: {exc}")
+            return fallback_forward(
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=transformer_options,
+            )
+
+        # Attention is intentionally outside the fallback catch: strict errors
+        # from a Sol/Sage patch must propagate, and should never be converted
+        # into an eager full-block retry by this unrelated fusion.
+        attention = block.attn(
+            h,
+            rope_freqs=rope_freqs,
+            transformer_options=transformer_options,
+        )
+        x = fused_gate_add(x, gate_msa, attention, row_index)
+        h = fused_modulate(block.norm2(x), shift_mlp, scale_mlp, row_index)
+        x = fused_gate_add(x, gate_mlp, block.mlp(h), row_index)
+        fusion_log.hit(x.shape[0], len(mod_segments))
+        return x
+
+    forward._minimax_h3_fusion_fallback = fallback_forward
+    return forward
+
+
+class MiniMaxH3FusedModulation:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/optimization"
+    DESCRIPTION = (
+        "Fuse MiniMax H3's segmented AdaLN scale/shift and gated residual "
+        "updates while reproducing the eager BF16 rounding exactly. Independent "
+        "of the selected attention backend."
+    )
+
+    def patch(self, model, enabled):
+        if not enabled:
+            return (model,)
+
+        diffusion_model = model.get_model_object("diffusion_model")
+        blocks = getattr(diffusion_model, "blocks", None)
+        if diffusion_model.__class__.__name__ != "MiniMaxH3Model" or blocks is None:
+            log.warning("[MiniMax H3 fusion] expected a MiniMax H3 model; returning it unchanged")
+            return (model,)
+
+        try:
+            from .sol_kernel.h3_fusion import (
+                fused_gate_add_,
+                fused_modulate_,
+                make_segment_index,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "MiniMax H3 Fused Modulation requires the installed Triton runtime"
+            ) from exc
+
+        patched = model.clone()
+        fusion_log = _FusionLog()
+        index_cache = _SegmentIndexCache(make_segment_index)
+        installed = 0
+        for i in range(len(blocks)):
+            path = f"diffusion_model.blocks.{i}.forward"
+            block = patched.get_model_object(f"diffusion_model.blocks.{i}")
+            prior = getattr(patched, "object_patches", {}).get(path)
+            if prior is not None and not hasattr(prior, "_minimax_h3_fusion_fallback"):
+                log.warning(
+                    "[MiniMax H3 fusion] block %d already has an unknown forward patch; leaving it unchanged",
+                    i,
+                )
+                continue
+            fallback_forward = prior if prior is not None else block.forward
+            if hasattr(fallback_forward, "_minimax_h3_fusion_fallback"):
+                fallback_forward = fallback_forward._minimax_h3_fusion_fallback
+            patched.add_object_patch(
+                path,
+                _make_fused_h3_block_forward(
+                    block,
+                    fallback_forward,
+                    index_cache,
+                    fusion_log,
+                    fused_modulate_,
+                    fused_gate_add_,
+                ),
+            )
+            installed += 1
+
+        log.info("[MiniMax H3 fusion] patched %d of %d blocks", installed, len(blocks))
+        return (patched,)
+
+
 class _Unsupported(Exception):
     pass
 
@@ -435,8 +627,9 @@ class MiniMaxH3ScheduledSolAttentionPatch:
                     {
                         "default": False,
                         "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
-                        "~1% extra numerical error; slightly slower at 8K.",
+                        "path. On SM120 the inline-Q pointer path is faster from "
+                        "8K upward and reduces peak memory (189 MiB at 32K), at "
+                        "~1% extra numerical error.",
                     },
                 ),
                 "int8_pv": (
@@ -596,8 +789,9 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
                     {
                         "default": False,
                         "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
-                        "~1% extra numerical error; slightly slower at 8K.",
+                        "path. On SM120 the inline-Q pointer path is faster from "
+                        "8K upward and reduces peak memory (189 MiB at 32K), at "
+                        "~1% extra numerical error.",
                     },
                 ),
                 "int8_pv": (
@@ -692,11 +886,13 @@ class MiniMaxH3MemoryEfficientSolAttentionPatch:
 
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ChunkFeedForward": MiniMaxH3ChunkFeedForward,
+    "MiniMaxH3FusedModulation": MiniMaxH3FusedModulation,
     "MiniMaxH3MemoryEfficientSolAttentionPatch": MiniMaxH3MemoryEfficientSolAttentionPatch,
     "MiniMaxH3ScheduledSolAttentionPatch": MiniMaxH3ScheduledSolAttentionPatch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ChunkFeedForward": "MiniMax H3 Chunk FeedForward",
+    "MiniMaxH3FusedModulation": "MiniMax H3 Fused Modulation",
     "MiniMaxH3MemoryEfficientSolAttentionPatch": "MiniMax H3 Memory Efficient Sol Attention Patch",
     "MiniMaxH3ScheduledSolAttentionPatch": "MiniMax H3 Scheduled Sol Attention Patch",
 }

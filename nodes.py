@@ -1,7 +1,8 @@
 """Sol-Attn (NVIDIA Sana / Sol-Engine) as an opt-in ComfyUI attention backend.
 
-Uses NVIDIA's Triton reference kernel on the architectures this package has
-actually validated: SM90, SM100, and SM120.
+Uses NVIDIA's Triton reference kernel on the explicit architecture set this
+package supports: SM89, SM90, SM100, SM120, and SM121. SM120 is hardware-tested
+locally; SM89 is forced-dispatch validated and SM121 is community-tested.
 
 Hard requirements of the kernel (anything else falls back to your normal
 backend, e.g. SageAttention):
@@ -166,8 +167,9 @@ class SolAttentionPatch:
                     {
                         "default": False,
                         "tooltip": "Quantize q/k to int8 for the exact attention "
-                        "path. Faster above ~16K tokens (measured 1.2-1.3x) at "
-                        "~1% extra numerical error; slightly slower at 8K.",
+                        "path. On SM120 the inline-Q pointer path is faster from "
+                        "8K upward and reduces peak memory (189 MiB at 32K), at "
+                        "~1% extra numerical error.",
                     },
                 ),
                 "int8_pv": (
