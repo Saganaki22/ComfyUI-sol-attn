@@ -350,15 +350,24 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
     inner = heads * head_dim
 
     def forward(x, rope_freqs=None, transformer_options={}):
-        s = x.shape[0]
+        # KJNodes' MiniMax H3 Low VRAM Attention block transfers ownership of
+        # its normed activation in a single-item list.  Peek while deciding
+        # whether Sol can take the call: an ineligible call must leave the list
+        # intact so KJ's fallback can pop it and release the activation itself.
+        handoff = isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0])
+        tensor = x[0] if handoff else x
+        handoff_released = False
         try:
-            if x.ndim != 2 or s < min_tokens or x.requires_grad:
+            if not torch.is_tensor(tensor):
+                raise _Unsupported("attention input is not a tensor")
+            s = tensor.shape[0]
+            if tensor.ndim != 2 or s < min_tokens or tensor.requires_grad:
                 raise _Unsupported("below min_tokens or autograd requested")
-            if x.dtype != torch.bfloat16 or x.device.type != "cuda":
+            if tensor.dtype != torch.bfloat16 or tensor.device.type != "cuda":
                 raise _Unsupported("requires bfloat16 on CUDA")
             if head_dim != 128:
                 raise _Unsupported(f"head_dim {head_dim} != 128")
-            arch = torch.cuda.get_device_capability(x.device)
+            arch = torch.cuda.get_device_capability(tensor.device)
             if arch not in SOL_ARCHES:
                 raise _Unsupported(f"unsupported SM{arch[0]}{arch[1]}")
 
@@ -378,13 +387,22 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
                         if sink_conditioning == "exact_kv_and_rows":
                             sink_q = sink_blocks
 
-            q, k, v = attn.qkv_proj(x).split(inner, dim=-1)
+            # Commit the KJNodes ownership transfer only after every dense
+            # fallback gate has passed.  Releasing `tensor` after qkv is the
+            # memory-saving behavior that the one-item list was introduced for.
+            if handoff:
+                tensor = x.pop()
+            device = tensor.device
+            q, k, v = attn.qkv_proj(tensor).split(inner, dim=-1)
+            if handoff:
+                del tensor
+                handoff_released = True
             q = q.view(1, s, heads, head_dim)
             k = k.view(1, s, heads, head_dim)
             v = v.view(1, s, heads, head_dim)
             if rope_freqs is not None:
-                qw = comfy.model_management.cast_to(attn.q_norm.weight, device=x.device)
-                kw = comfy.model_management.cast_to(attn.k_norm.weight, device=x.device)
+                qw = comfy.model_management.cast_to(attn.q_norm.weight, device=device)
+                kw = comfy.model_management.cast_to(attn.k_norm.weight, device=device)
                 comfy.quant_ops.ck.rms_rope_split_half_(
                     q, k, rope_freqs, qw, kw,
                     epsilon=attn.q_norm.eps,
@@ -404,6 +422,17 @@ def _make_sol_attention_forward(attn, fallback_forward, tau, min_tokens, strict,
         except Exception as e:
             if strict:
                 raise
+            # Once a low-VRAM handoff has been consumed and its activation
+            # released, replaying the full forward is impossible without
+            # retaining the very allocation KJNodes is trying to free.
+            if handoff and not x:
+                if handoff_released:
+                    raise
+                return fallback_forward(
+                    tensor,
+                    rope_freqs=rope_freqs,
+                    transformer_options=transformer_options,
+                )
             sol_log.miss(f"{type(e).__name__}: {e}")
         return fallback_forward(x, rope_freqs=rope_freqs, transformer_options=transformer_options)
 

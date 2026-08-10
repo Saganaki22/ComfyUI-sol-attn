@@ -168,5 +168,66 @@ class H3FusionTests(unittest.TestCase):
         self.assertTrue(torch.equal(expected, actual))
 
 
+class H3AttentionHandoffTests(unittest.TestCase):
+    def test_dense_fallback_preserves_kjnodes_handoff(self):
+        minimax = importlib.import_module(f"{REPO_ROOT.name}.minimax")
+        activation = torch.zeros((32, 128), dtype=torch.bfloat16)
+        handoff = [activation]
+        fallback_calls = 0
+
+        def fallback(value, **kwargs):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            self.assertIs(value, handoff)
+            return value.pop()
+
+        class Attention:
+            heads = 1
+            head_dim = 128
+
+        wrapped = minimax._make_sol_attention_forward(
+            Attention(), fallback, 1.3, 4096, False, minimax._SolLog()
+        )
+        actual = wrapped(handoff)
+        self.assertIs(actual, activation)
+        self.assertEqual(fallback_calls, 1)
+        self.assertEqual(handoff, [])
+
+    @unittest.skipUnless(GPU_SUPPORTED, "requires a supported CUDA GPU")
+    def test_sol_path_consumes_kjnodes_handoff(self):
+        minimax = importlib.import_module(f"{REPO_ROOT.name}.minimax")
+
+        class Attention:
+            heads = 1
+            head_dim = 128
+            qkv_proj = staticmethod(lambda value: torch.cat((value, value, value), dim=-1))
+            q_norm = staticmethod(lambda value: value)
+            k_norm = staticmethod(lambda value: value)
+            out_proj = staticmethod(lambda value: value)
+
+        activation = torch.randn((65, 128), device="cuda", dtype=torch.bfloat16)
+        handoff = [activation]
+        fallback_calls = 0
+
+        def fallback(value, **kwargs):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return value
+
+        original_sol_attn = minimax.sol_attn
+        try:
+            minimax.sol_attn = lambda q, k, v, **kwargs: v
+            wrapped = minimax._make_sol_attention_forward(
+                Attention(), fallback, 1.3, 1, True, minimax._SolLog()
+            )
+            actual = wrapped(handoff)
+        finally:
+            minimax.sol_attn = original_sol_attn
+
+        self.assertEqual(handoff, [])
+        self.assertEqual(fallback_calls, 0)
+        self.assertTrue(torch.equal(actual, activation))
+
+
 if __name__ == "__main__":
     unittest.main()

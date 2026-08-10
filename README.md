@@ -6,7 +6,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.6.0**
+**Version: v0.6.1**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -16,6 +16,13 @@
 Sparse attention and memory patches for video diffusion in ComfyUI, built around NVIDIA's **Sol-Attn** Triton reference kernel and tuned for native-Windows consumer Blackwell (SM120 / RTX 50-series). Ships a generic per-model Sol-Attn patch plus four MiniMax H3-specific nodes for copy-free attention, scheduled sparsity, exact modulation fusion, and feed-forward peak-memory reduction.
 
 > Legal note: the kernel in `sol_kernel/` is vendored NVIDIA source (Apache-2.0), modified locally. NVIDIA now ships an optional SM120 CuTe backend for Linux; this repository's native-Windows Triton pointer path and residual-int8 extensions remain local changes.
+
+## v0.6.1
+
+- **KJNodes Low-VRAM compatibility** — both MiniMax H3 Sol nodes now support the single-item activation-list handoff used by KJNodes' `MiniMax H3 Low VRAM Attention`. Sol peeks at the tensor while applying its eligibility gates, leaves the handoff intact for dense fallback, and consumes/releases it when the Sol path runs.
+- **Combination covered by regression tests** — `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` and the scheduled Sol variant now run together without the previous `'list' object has no attribute 'shape'` error. KJ's early activation release is preserved on both sparse and dense calls.
+- **No numerical or kernel changes** — attention math, model weights, SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
+- **Existing limitation remains** — KJNodes' `MiniMax H3 Low VRAM Attention` still should not be combined with `MiniMax H3 Fused Modulation`, because both patch the complete H3 block forward. This release fixes its composition with the two local H3 **Sol Attention** nodes.
 
 ## v0.6.0
 

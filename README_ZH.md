@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.6.0**
+**版本: v0.6.1**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -12,6 +12,13 @@
 ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVIDIA 的 **Sol-Attn** Triton 参考内核构建,并针对原生 Windows 消费级 Blackwell(SM120 / RTX 50 系列)调优。包含一个通用的逐模型 Sol-Attn 补丁,以及四个 MiniMax H3 专用节点:零拷贝注意力、调度稀疏、逐位精确的调制融合和前馈峰值显存削减。
 
 > 法律说明:`sol_kernel/` 中的内核为 NVIDIA 源代码(Apache-2.0)的本地修改副本。NVIDIA 现已为 Linux 提供可选的 SM120 CuTe 后端;本仓库的原生 Windows Triton 指针路径和残差 int8 扩展仍是本地改动。
+
+## v0.6.1
+
+- **兼容 KJNodes 低显存节点** —— 两个 MiniMax H3 Sol 节点现已支持 KJNodes `MiniMax H3 Low VRAM Attention` 使用的单元素激活列表交接。Sol 在判断是否接管调用时只读取张量;稠密回退时保留交接列表,运行 Sol 时则消费并释放它。
+- **组合回归测试** —— `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` 及 Scheduled Sol 变体现在可以共同运行,不再出现 `'list' object has no attribute 'shape'`。稀疏与稠密调用均保留 KJ 的提前释放激活机制。
+- **数值与内核不变** —— 注意力数学、模型权重、SM89/SM120 指针分发、SM90/SM100/SM121 TMA 分发及输出精度均未改变。全部 7 项回归测试通过,真实 KJ 低显存 block-forward GPU 集成测试也已通过。v0.6.0 的基准矩阵仍然有效。
+- **原有限制不变** —— KJNodes `MiniMax H3 Low VRAM Attention` 仍不应与 `MiniMax H3 Fused Modulation` 同时使用,因为两者都会修改完整 H3 block forward。本版本修复的是它与本仓库两个 H3 **Sol Attention** 节点的组合。
 
 ## v0.6.0
 
