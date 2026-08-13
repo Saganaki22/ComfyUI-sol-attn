@@ -2,7 +2,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本: v0.6.1**
+**版本: v0.6.2**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -13,17 +13,24 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 
 > 法律说明:`sol_kernel/` 中的内核为 NVIDIA 源代码(Apache-2.0)的本地修改副本。NVIDIA 现已为 Linux 提供可选的 SM120 CuTe 后端;本仓库的原生 Windows Triton 指针路径和残差 int8 扩展仍是本地改动。
 
+## v0.6.2
+
+- **支持 SM86 / RTX 30 系列** —— MiniMax H3 Sol Attention 现通过 SM89 与 SM120 共用的指针内核族支持 Ampere SM86 GPU。SM90/SM100/SM121 继续使用原有 TMA 路径。
+- **社区硬件验证** —— RTX 3090 Ti 在严格模式下完成了 25,323-token 的 MiniMax H3 工作流并确认 Sol 已激活,随后又在同时关闭 `int8_qk` 与 `int8_pv` 的情况下成功生成。残差 int8 QK/PV 路径也已成功运行。
+- **回归测试覆盖** —— 适用于 SM86 的 6 项仓库测试及贡献者本地的运行时版本检查全部通过;仅用于 SM120 的 pointer-vs-TMA 对比按预期跳过。合并后,仓库全部 7 项测试也在 SM120 上通过。覆盖架构分发、指针 INT8 路径、H3 调制融合和 KJNodes 交接。
+- **数值不变** —— 本版本仅启用新增架构,不改变注意力数学、权重、稀疏设置或输出质量行为。现有 SM89、SM90、SM100、SM120 与 SM121 分发保持不变。SM86 性能尚未进行正式基准测试。
+
 ## v0.6.1
 
 - **兼容 KJNodes 低显存节点** —— 两个 MiniMax H3 Sol 节点现已支持 KJNodes `MiniMax H3 Low VRAM Attention` 使用的单元素激活列表交接。Sol 在判断是否接管调用时只读取张量;稠密回退时保留交接列表,运行 Sol 时则消费并释放它。
 - **组合回归测试** —— `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` 及 Scheduled Sol 变体现在可以共同运行,不再出现 `'list' object has no attribute 'shape'`。稀疏与稠密调用均保留 KJ 的提前释放激活机制。
-- **数值与内核不变** —— 注意力数学、模型权重、SM86/SM89/SM120 指针分发、SM90/SM100/SM121 TMA 分发及输出精度均未改变。全部 7 项回归测试通过,真实 KJ 低显存 block-forward GPU 集成测试也已通过。v0.6.0 的基准矩阵仍然有效。
+- **数值与内核不变** —— 注意力数学、模型权重、SM89/SM120 指针分发、SM90/SM100/SM121 TMA 分发及输出精度均未改变。全部 7 项回归测试通过,真实 KJ 低显存 block-forward GPU 集成测试也已通过。v0.6.0 的基准矩阵仍然有效。
 - **原有限制不变** —— KJNodes `MiniMax H3 Low VRAM Attention` 仍不应与 `MiniMax H3 Fused Modulation` 同时使用,因为两者都会修改完整 H3 block forward。本版本修复的是它与本仓库两个 H3 **Sol Attention** 节点的组合。
 
 ## v0.6.0
 
-- **更快的 SM120 forward 分发** —— RTX 5090 现在默认使用指针 forward;SM86/SM89 保持指针路径,SM90/100/121 保持 TMA。H3 形状 `B=1,T=8192,H=56,D=128` 下,bf16 指针路径吞吐量为 TMA 的 1.25×,输出逐位一致;残差 int8 同样逐位一致。
-- **内联残差 int8 Q 预处理** —— SM86/SM89/SM120 的 `diag` 指针内核直接利用 forward 已加载的 BF16 Q tile 完成 Q 量化与路由阈值计算,不再生成 Q-int8/Q-scale/threshold 中间张量。32K H3 tokens 下实测峰值分配减少 189 MiB;整除/非整除长度、精确汇聚和 `int8_pv` 开关均与旧路径逐位一致。
+- **更快的 SM120 forward 分发** —— RTX 5090 现在默认使用指针 forward;SM89 保持指针路径,SM90/100/121 保持 TMA。H3 形状 `B=1,T=8192,H=56,D=128` 下,bf16 指针路径吞吐量为 TMA 的 1.25×,输出逐位一致;残差 int8 同样逐位一致。
+- **内联残差 int8 Q 预处理** —— SM89/SM120 的 `diag` 指针内核直接利用 forward 已加载的 BF16 Q tile 完成 Q 量化与路由阈值计算,不再生成 Q-int8/Q-scale/threshold 中间张量。32K H3 tokens 下实测峰值分配减少 189 MiB;整除/非整除长度、精确汇聚和 `int8_pv` 开关均与旧路径逐位一致。
 - **逐位精确的 H3 调制融合** —— 新增 `MiniMax H3 Fused Modulation` 节点,融合全部 50 个 DiT 块的分段 AdaLN scale/shift 与门控残差更新。它显式复现 eager BF16 中间舍入,真实 ComfyUI `DiTBlock` 测试逐位一致。在 38,247 × 5,376 形状下,scale/shift 独立实测 1.91×,gate/add 1.22×。
 - **注意力补丁组合保持不变** —— 融合节点在运行时动态解析每个块的 attention 与 MLP,因此推荐的 `全局 KJ Sage → H3 显存高效 Sage → 本地 H3 Sol` 链仍可共同工作,且不会改变 Sol 之外的注意力调用。
 - **全新完整发布矩阵** —— 在 autotune 缓存热身后重测 8K/16K/32K/65K:bf16 吞吐量为 SageAttention 的 1.38–1.65×,残差 `int8_qk` 为 1.73–1.97×,按需开启的 `int8_qk+pv` 为 1.98–2.33×。相对 bf16 Sol 路径的 L2 误差保持为 `0.00802`/`0.01396`。

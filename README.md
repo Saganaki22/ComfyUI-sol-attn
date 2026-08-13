@@ -6,7 +6,7 @@
 
 **English** | **[中文](./README_ZH.md)**
 
-**Version: v0.6.1**
+**Version: v0.6.2**
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![GPU](https://img.shields.io/badge/tested-RTX%205090%20(SM120)-76b900)](https://www.nvidia.com/)
@@ -17,17 +17,24 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 > Legal note: the kernel in `sol_kernel/` is vendored NVIDIA source (Apache-2.0), modified locally. NVIDIA now ships an optional SM120 CuTe backend for Linux; this repository's native-Windows Triton pointer path and residual-int8 extensions remain local changes.
 
+## v0.6.2
+
+- **SM86 / RTX 30-series support** — MiniMax H3 Sol Attention now supports Ampere SM86 GPUs through the existing pointer-kernel family used by SM89 and SM120. SM90/SM100/SM121 remain on their existing TMA paths.
+- **Community hardware validation** — an RTX 3090 Ti completed a strict-mode 25,323-token MiniMax H3 workflow with Sol active, then completed a second generation with both `int8_qk` and `int8_pv` disabled. The residual-int8 QK/PV paths were also exercised successfully.
+- **Regression coverage** — the six repository tests applicable to SM86 plus the contributor's local runtime-stack check passed; the SM120-only pointer-vs-TMA comparison was correctly skipped. After merge, all seven repository tests also passed on SM120. Coverage includes architecture dispatch, pointer INT8 paths, H3 modulation fusion, and KJNodes handoff.
+- **No numerical changes** — this release enables an additional architecture without changing attention math, weights, sparsity settings, or output-quality behavior. Existing SM89, SM90, SM100, SM120, and SM121 dispatch is unchanged. SM86 performance has not yet been formally benchmarked.
+
 ## v0.6.1
 
 - **KJNodes Low-VRAM compatibility** — both MiniMax H3 Sol nodes now support the single-item activation-list handoff used by KJNodes' `MiniMax H3 Low VRAM Attention`. Sol peeks at the tensor while applying its eligibility gates, leaves the handoff intact for dense fallback, and consumes/releases it when the Sol path runs.
 - **Combination covered by regression tests** — `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` and the scheduled Sol variant now run together without the previous `'list' object has no attribute 'shape'` error. KJ's early activation release is preserved on both sparse and dense calls.
-- **No numerical or kernel changes** — attention math, model weights, SM86/SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
+- **No numerical or kernel changes** — attention math, model weights, SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
 - **Existing limitation remains** — KJNodes' `MiniMax H3 Low VRAM Attention` still should not be combined with `MiniMax H3 Fused Modulation`, because both patch the complete H3 block forward. This release fixes its composition with the two local H3 **Sol Attention** nodes.
 
 ## v0.6.0
 
 - **Faster SM120 forward dispatch** — RTX 5090 now uses the pointer forward kernels, while SM89 remains pointer and SM90/100/121 remain TMA. At H3's `B=1, T=8192, H=56, D=128` shape, the SM120 pointer path measured 1.25× the TMA throughput in bf16 and produced bit-identical output; residual-int8 also remained bit-identical.
-- **Inline residual-int8 Q preparation** — SM86/SM89/SM120 diagonal-threshold pointer kernels quantize Q and derive the routing threshold from the BF16 Q tile already loaded by the forward. This removes the materialized Q-int8/Q-scale/threshold producer. At 32K H3 tokens it reduced measured peak allocation by 189 MiB; output matched the former path bit-for-bit for aligned/ragged lengths, exact sinks, and `int8_pv` on/off.
+- **Inline residual-int8 Q preparation** — SM89/SM120 diagonal-threshold pointer kernels quantize Q and derive the routing threshold from the BF16 Q tile already loaded by the forward. This removes the materialized Q-int8/Q-scale/threshold producer. At 32K H3 tokens it reduced measured peak allocation by 189 MiB; output matched the former path bit-for-bit for aligned/ragged lengths, exact sinks, and `int8_pv` on/off.
 - **Exact MiniMax H3 modulation fusion** — the new `MiniMax H3 Fused Modulation` node fuses segmented AdaLN scale/shift and gated residual updates across all 50 DiT blocks. It explicitly reproduces eager BF16 rounding and matched a real ComfyUI `DiTBlock` bit-for-bit. At 38,247 × 5,376, scale/shift measured 1.91× faster and gate/add 1.22× faster in isolation.
 - **Attention patches still compose** — the fusion resolves each block's attention and MLP dynamically, so the recommended `global KJ Sage → H3 memory-efficient Sage → local H3 Sol` chain remains intact. It does not install an attention backend or change calls outside Sol.
 - **Fresh full release matrix** — a warmed-cache rerun at 8K/16K/32K/65K puts bf16 at 1.38–1.65× SageAttention throughput, residual `int8_qk` at 1.73–1.97×, and opt-in `int8_qk+pv` at 1.98–2.33×. Accuracy stayed at relative L2 `0.00802`/`0.01396` versus the bf16 Sol path.
