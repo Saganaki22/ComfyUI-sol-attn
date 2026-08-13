@@ -46,13 +46,13 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 - **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.6× closer than full-key int8 designs (0.029).
 - **Zero-copy by design** — the kernel reads H3's fused qkv views directly; no contiguous copies, 1.3–2.7 GiB lower peak at long lengths.
 - **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).
-- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), int8 q/k and P·V quantization, SM89–SM121 support, and honest per-call fallback.
+- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), int8 q/k and P·V quantization, SM86–SM121 support, and honest per-call fallback.
 
 ## Features
 
 - **Opt-in per-model patching** — only the model you wire through a node is affected; the rest of your graph is untouched.
 - **Two Sol-Attn integration paths** — a generic hook-based node for any model, and a MiniMax H3 node that feeds the kernel strided views of the fused qkv projection with zero q/k/v copies, plus an exact-KV sink for H3's packed conditioning rows.
-- **SM89 through SM121** — pointer kernels on SM89 and SM120; TMA descriptor kernels on SM90, SM100, and SM121. SM121 covers the DGX Spark.
+- **SM86 through SM121** — pointer kernels on SM86, SM89, and SM120; TMA descriptor kernels on SM90, SM100, and SM121. SM121 covers the DGX Spark.
 - **Scheduled sparsity** — ramp `tau` across sampling (sparse early, dense late) with a plotted schedule preview.
 - **Bit-exact H3 modulation fusion** — combines segmented AdaLN and gated residual elementwise work without changing eager BF16 output or the selected attention backend.
 - **Feed-forward chunking** — caps MiniMax H3's MLP peak activation memory, bit-identical output.
@@ -61,7 +61,7 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 
 ## Prerequisites
 
-- NVIDIA GPU: **SM89, SM90, SM100, SM120, or SM121** — SM89/SM120 run the pointer forward kernels; SM90/100/121 run TMA. Only SM120 is tested on hardware by this repository; SM121 (DGX Spark) is enabled by PR #3 and remains on its existing TMA path; SM89 is validated by forced dispatch, not on an SM89 GPU.
+- NVIDIA GPU: **SM86, SM89, SM90, SM100, SM120, or SM121** — SM86/89/120 run the pointer forward kernels; SM90/100/121 run TMA. SM120 is tested and benchmarked locally; SM86 is community hardware smoke-tested on an RTX 3090ti, SM89 is community hardware smoke-tested on an RTX 4080 SUPER ([issue #2](https://github.com/Saganaki22/ComfyUI-sol-attn/issues/2)); and SM121 (DGX Spark) is community-tested. SM86/SM89 performance is not yet benchmarked here.
 - PyTorch with CUDA, **bfloat16** support
 - **Triton** with `triton.tools.tensor_descriptor` (TMA) — verified on 3.6.0
 - ComfyUI (developed against 0.30.0)
@@ -299,7 +299,7 @@ On the environment under "Tested on":
 - Strided-view kernel output is **bit-identical** to contiguous input (max abs diff 0), including at ragged sequence lengths (8,191 / 12,345 / 38,247 tokens).
 - All-exact mode (`tau=-100`, validation only) matches PyTorch SDPA at relative L2 error `0.00097`.
 - The full patched H3 attention module matches the stock forward at relative L2 error `0.00009`, consistent with bf16 accumulation differences.
-- The SM89/SM120 pointer kernel twins are bit-identical to the TMA kernels (bf16 and int8_qk); sink-forced-exact mode matches dense output.
+- The shared SM89/SM120 pointer implementation is bit-identical to the TMA kernels when cross-checked by forced dispatch on SM120 (bf16 and int8_qk); sink-forced-exact mode matches dense output.
 - Inline-Q residual-int8 matches the former materialized-Q path bit-for-bit for aligned/ragged lengths, conditioning sinks, dense query rows, and `int8_pv` on/off.
 - Fused H3 modulation/gating matches eager BF16 output bit-for-bit with both BF16 and FP32 AdaLN tables, including a real ComfyUI `DiTBlock` integration test.
 - Chunked ×2 MLP output matches the full MLP exactly (`assert_close`, rtol=atol=0).
@@ -330,7 +330,7 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 - **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); the `sink_conditioning` option implements the paper's exact conditioning-K/V handling, but dense first-layer scheduling and the rest of the paper's more conservative recipe are not implemented.
 - **The native-Windows SM120 pointer path and SM121 enablement are repository integrations.** NVIDIA's current Sol-Engine branch has an optional Linux CuTe backend for SM120 and a portable Triton fallback; this package retains its own Comfy-compatible strided, residual-int8 implementation. SM121 (DGX Spark) support originated in community PR #3.
 - **The H3-specific nodes bypass ComfyUI's attention hook.** Other patches attached to `optimized_attention_override` do not run on blocks where Sol is active, and attention `transformer_options` patches are not applied on the Sol path.
-- **Architecture paths are intentionally separate.** SM120 now uses the faster pointer forward validated on RTX 5090, while SM121 retains its existing TMA path and is not hardware-tested by this repository. SM89 uses the same pointer family but is validated only by forced dispatch on SM120. SM90/100 remain TMA. Run with `strict=true` once on a new environment.
+- **Architecture paths are intentionally separate.** SM86, SM89, and SM120 use the pointer family; SM120 is validated and benchmarked on RTX 5090, while SM86 and SM89 are hardware smoke-tested on RTX 30- and RTX 40-series respectively but are not yet performance-benchmarked here. The shared SM89/SM120 implementation is additionally cross-checked by forced dispatch on SM120. SM90/100/121 remain TMA. Run with `strict=true` once on a new environment.
 - NVIDIA's published ~2.0–2.3× figures are for Sol-Engine as a whole (CuTe kernels, NVFP4, block fusion, datacenter GPUs). This is the Triton reference kernel alone — a different thing entirely.
 - The [KingGore Blackwell fork](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell) was evaluated at H3 width: 4.334 ms for its `flex_attention` path vs 3.256 ms for this Triton reference at 8,192 tokens. It uses a hard block mask (unselected blocks are dropped, not approximated), so it is a different method, and its import-time repair that moves files inside the installed PyTorch package is intentionally excluded here.
 

@@ -20,6 +20,7 @@ for path in (str(COMFY_ROOT), str(CUSTOM_NODES), str(REPO_ROOT)):
 
 fwd = importlib.import_module("sol_kernel.fwd")
 GPU_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability() in {
+    (8, 6),
     (8, 9),
     (9, 0),
     (10, 0),
@@ -30,6 +31,7 @@ GPU_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability()
 
 class ArchitectureDispatchTests(unittest.TestCase):
     def test_pointer_architectures_are_explicit(self):
+        self.assertTrue(fwd._use_pointer_arch((8, 6)))
         self.assertTrue(fwd._use_pointer_arch((8, 9)))
         self.assertTrue(fwd._use_pointer_arch((12, 0)))
         self.assertFalse(fwd._use_pointer_arch((9, 0)))

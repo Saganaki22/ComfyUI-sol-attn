@@ -3,7 +3,7 @@
 Loads use plain pointers with explicit strides: TensorDescriptor emulation on
 pre-Hopper arches costs several times more, while on Hopper and newer the
 difference is negligible for these small streaming kernels. The compute-heavy
-forward uses pointers on SM89/SM120 and TMA descriptors on SM90/SM100/SM121.
+forward uses pointers on SM86/SM89/SM120 and TMA descriptors on SM90/SM100/SM121.
 """
 
 from __future__ import annotations

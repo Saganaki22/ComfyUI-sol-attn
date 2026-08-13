@@ -42,13 +42,13 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 - **最佳的 int8 精度** —— 本内核仅量化 K 的块内*残差*,均值项以 bf16 精确保留:相对 L2 误差 0.008,比全键 int8 设计(0.029)接近精确路径约 3.6 倍。
 - **零拷贝设计** —— 内核直接读取 H3 融合 qkv 投影的视图;其他 TMA 实现会先拷贝 q/k/v(长序列下额外增加 1.3–2.7 GiB 峰值显存与拷贝时间)。
 - **数学实现交叉验证** —— 本仓库 bf16 路径与 kijai 的独立实现逐位一致(0.000000),全精确模式与 SDPA 一致(0.00097)。
-- **不止于内核** —— 带曲线预览的调度 tau、条件精确 KV 汇聚、前馈分块(MLP 峰值 −37%)、int8 q/k 与 P·V 量化、SM89–SM121 支持,以及诚实的逐调用回退。
+- **不止于内核** —— 带曲线预览的调度 tau、条件精确 KV 汇聚、前馈分块(MLP 峰值 −37%)、int8 q/k 与 P·V 量化、SM86–SM121 支持,以及诚实的逐调用回退。
 
 ## 功能特性
 
 - **按需逐模型打补丁** —— 只有接入节点的模型受影响,工作流其余部分不受影响。
 - **两条 Sol-Attn 集成路径** —— 适用于任意模型的通用钩子节点,以及 MiniMax H3 专用节点:将融合 qkv 投影的跨步视图直接送入内核,零 q/k/v 拷贝,并为 H3 打包的条件行提供精确 KV 汇聚。
-- **SM89 至 SM121** —— SM89 与 SM120 使用指针内核;SM90、SM100 与 SM121 使用 TMA 描述符内核。SM121 覆盖 DGX Spark。
+- **SM86 至 SM121** —— SM86、SM89 与 SM120 使用指针内核;SM90、SM100 与 SM121 使用 TMA 描述符内核。SM121 覆盖 DGX Spark。
 - **调度稀疏** —— 在采样过程中渐变 `tau`(前期稀疏、后期致密),并输出调度曲线预览图。
 - **逐位精确的 H3 调制融合** —— 合并分段 AdaLN 与门控残差逐元素操作,不改变 eager BF16 输出或所选注意力后端。
 - **前馈分块** —— 压低 MiniMax H3 的 MLP 峰值激活显存,输出逐位一致。
@@ -57,7 +57,7 @@ ComfyUI 视频扩散模型的稀疏注意力与显存优化节点包,基于 NVID
 
 ## 前置条件
 
-- NVIDIA GPU:**SM89、SM90、SM100、SM120 或 SM121** —— SM89/SM120 运行指针 forward,SM90/100/121 运行 TMA。本仓库仅在 SM120 硬件上实测;SM121(DGX Spark)保持原有 TMA 路径;SM89 路径通过 SM120 强制分发验证,未在 SM89 GPU 上实测。
+- NVIDIA GPU:**SM86、SM89、SM90、SM100、SM120 或 SM121** —— SM86/89/120 运行指针 forward,SM90/100/121 运行 TMA。SM120 已在本地完成测试和基准;SM86 已在 RTX 30 系列上完成硬件冒烟测试;SM89 已由社区在 RTX 4080 SUPER 上完成硬件冒烟测试([issue #2](https://github.com/Saganaki22/ComfyUI-sol-attn/issues/2));SM121(DGX Spark)也已由社区测试。SM86/SM89 尚未在本仓库完成性能基准。
 - 支持 CUDA 与 **bfloat16** 的 PyTorch
 - 带有 `triton.tools.tensor_descriptor`(TMA)的 **Triton** —— 已在 3.6.0 上验证
 - ComfyUI(基于 0.30.0 开发)
@@ -290,7 +290,7 @@ H3 尺寸(B=1,H=56,D=128,bf16 输入),随机张量,`tau=1.0`,3 次热身后取 2
 - 跨步视图内核输出与连续输入**逐位一致**(最大绝对差 0),包括非整除序列长度(8,191 / 12,345 / 38,247 tokens)。
 - 全精确模式(`tau=-100`,仅用于验证)与 PyTorch SDPA 的相对 L2 误差为 `0.00097`。
 - 完整修补的 H3 注意力模块与原版 forward 的相对 L2 误差为 `0.00009`,符合 bf16 累加差异。
-- SM89/SM120 指针内核孪生版本与 TMA 内核逐位一致(bf16 与 int8_qk);强制精确的汇聚模式与稠密输出一致。
+- 共享的 SM89/SM120 指针实现通过 SM120 强制分发与 TMA 内核交叉验证后逐位一致(bf16 与 int8_qk);强制精确的汇聚模式与稠密输出一致。
 - 内联 Q 残差 int8 与旧的中间张量路径逐位一致,覆盖整除/非整除长度、条件精确 KV、致密查询行和 `int8_pv` 开关。
 - H3 调制/门控融合在 BF16 与 FP32 AdaLN 表上均与 eager BF16 逐位一致,并通过真实 ComfyUI `DiTBlock` 集成测试。
 - 分块 ×2 的 MLP 输出与完整 MLP 完全一致(`assert_close`,rtol=atol=0)。
@@ -321,7 +321,7 @@ ComfyUI 核心自带 **EasyCache**/`LazyCache` 节点(`comfy_extras/nodes_easyca
 - **MiniMax H3 不在 Sol-Attn 论文评估范围内。** H3 使用联合打包序列(文本、条件、音频、视频);`sink_conditioning` 选项已实现论文的精确条件 K/V 处理,但首层稠密调度等论文中更保守配方的其余内容未实现。
 - **原生 Windows SM120 指针路径与 SM121 集成属于本仓库。** NVIDIA 当前 Sol-Engine 分支为 SM120 提供可选的 Linux CuTe 后端与可移植 Triton 回退;本包仍保留适配 Comfy 的跨步布局和残差 int8 实现。SM121(DGX Spark)支持源自社区 PR #3。
 - **H3 专用节点绕过了 ComfyUI 的注意力钩子。** 挂在 `optimized_attention_override` 上的其他补丁在 Sol 激活的块上不会运行,注意力相关的 `transformer_options` 补丁也不会在 Sol 路径上应用。
-- **各架构路径有意保持独立。** SM120 现在使用 RTX 5090 上验证更快的指针 forward;SM121 保持原有 TMA 路径,本仓库未在其硬件上实测。SM89 使用相同指针内核族,但仅在 SM120 上通过强制分发验证。SM90/100 保持 TMA。在新环境上请先以 `strict=true` 跑一次。
+- **各架构路径有意保持独立。** SM86、SM89 与 SM120 使用指针内核族;SM120 已在 RTX 5090 上验证并完成基准测试;SM86 与 SM89 分别在 RTX 30、RTX 40 系列上完成硬件冒烟测试,但尚未在本仓库完成性能基准。共享的 SM89/SM120 实现还通过 SM120 强制分发进行了交叉验证。SM90/100/121 保持 TMA。在新环境上请先以 `strict=true` 跑一次。
 - NVIDIA 公布的约 2.0–2.3× 数据面向整个 Sol-Engine(CuTe 内核、NVFP4、块融合、数据中心 GPU)。本包仅为 Triton 参考内核 —— 完全是另一回事。
 - 已评估 [KingGore Blackwell 分支](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell):其 `flex_attention` 路径在 H3 尺寸、8,192 tokens 下为 4.334 ms,本 Triton 参考为 3.256 ms。它使用硬块掩码(未选中的块被丢弃而非近似),属于不同方法;其导入期修改已安装 PyTorch 包内文件的修复手段在此被有意排除。
 
