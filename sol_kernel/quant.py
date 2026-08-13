@@ -4,7 +4,7 @@ k is quantized per token after centering by its 64-token block mean, so only
 the small per-block residual goes through the int8 dot; the mean term is the
 routing score the forward kernel already computes exactly in bf16 and is added
 back there. The TMA/materialized reference quantizes q per token together with
-the diagonal routing threshold; SM89/SM120 instead perform both operations in
+the diagonal routing threshold; SM86/SM89/SM120 instead perform both operations in
 the pointer forward from its resident Q tile. Loads use plain pointers with
 explicit strides so the preprocessing also runs on pre-Hopper architectures.
 """

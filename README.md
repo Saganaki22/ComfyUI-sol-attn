@@ -21,13 +21,13 @@ Sparse attention and memory patches for video diffusion in ComfyUI, built around
 
 - **KJNodes Low-VRAM compatibility** — both MiniMax H3 Sol nodes now support the single-item activation-list handoff used by KJNodes' `MiniMax H3 Low VRAM Attention`. Sol peeks at the tensor while applying its eligibility gates, leaves the handoff intact for dense fallback, and consumes/releases it when the Sol path runs.
 - **Combination covered by regression tests** — `KJ MiniMax H3 Low VRAM Attention → MiniMax H3 Memory Efficient Sol Attention` and the scheduled Sol variant now run together without the previous `'list' object has no attribute 'shape'` error. KJ's early activation release is preserved on both sparse and dense calls.
-- **No numerical or kernel changes** — attention math, model weights, SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
+- **No numerical or kernel changes** — attention math, model weights, SM86/SM89/SM120 pointer dispatch, SM90/SM100/SM121 TMA dispatch, and output accuracy are unchanged. All seven regression tests pass, and a real KJ low-VRAM block-forward GPU integration test also passed. The v0.6.0 benchmark matrix remains current.
 - **Existing limitation remains** — KJNodes' `MiniMax H3 Low VRAM Attention` still should not be combined with `MiniMax H3 Fused Modulation`, because both patch the complete H3 block forward. This release fixes its composition with the two local H3 **Sol Attention** nodes.
 
 ## v0.6.0
 
 - **Faster SM120 forward dispatch** — RTX 5090 now uses the pointer forward kernels, while SM89 remains pointer and SM90/100/121 remain TMA. At H3's `B=1, T=8192, H=56, D=128` shape, the SM120 pointer path measured 1.25× the TMA throughput in bf16 and produced bit-identical output; residual-int8 also remained bit-identical.
-- **Inline residual-int8 Q preparation** — SM89/SM120 diagonal-threshold pointer kernels quantize Q and derive the routing threshold from the BF16 Q tile already loaded by the forward. This removes the materialized Q-int8/Q-scale/threshold producer. At 32K H3 tokens it reduced measured peak allocation by 189 MiB; output matched the former path bit-for-bit for aligned/ragged lengths, exact sinks, and `int8_pv` on/off.
+- **Inline residual-int8 Q preparation** — SM86/SM89/SM120 diagonal-threshold pointer kernels quantize Q and derive the routing threshold from the BF16 Q tile already loaded by the forward. This removes the materialized Q-int8/Q-scale/threshold producer. At 32K H3 tokens it reduced measured peak allocation by 189 MiB; output matched the former path bit-for-bit for aligned/ragged lengths, exact sinks, and `int8_pv` on/off.
 - **Exact MiniMax H3 modulation fusion** — the new `MiniMax H3 Fused Modulation` node fuses segmented AdaLN scale/shift and gated residual updates across all 50 DiT blocks. It explicitly reproduces eager BF16 rounding and matched a real ComfyUI `DiTBlock` bit-for-bit. At 38,247 × 5,376, scale/shift measured 1.91× faster and gate/add 1.22× faster in isolation.
 - **Attention patches still compose** — the fusion resolves each block's attention and MLP dynamically, so the recommended `global KJ Sage → H3 memory-efficient Sage → local H3 Sol` chain remains intact. It does not install an attention backend or change calls outside Sol.
 - **Fresh full release matrix** — a warmed-cache rerun at 8K/16K/32K/65K puts bf16 at 1.38–1.65× SageAttention throughput, residual `int8_qk` at 1.73–1.97×, and opt-in `int8_qk+pv` at 1.98–2.33×. Accuracy stayed at relative L2 `0.00802`/`0.01396` versus the bf16 Sol path.
@@ -46,13 +46,13 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 - **Best int8 accuracy** — our kernel quantizes only K's per-block *residual* and keeps the mean term exact in bf16: 0.008 relative L2 vs the exact path, ~3.6× closer than full-key int8 designs (0.029).
 - **Zero-copy by design** — the kernel reads H3's fused qkv views directly; no contiguous copies, 1.3–2.7 GiB lower peak at long lengths.
 - **Cross-validated math** — our bf16 path is bit-identical to kijai's independent implementation (0.000000), and SDPA-parity in all-exact mode (0.00097).
-- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), int8 q/k and P·V quantization, SM89–SM121 support, and honest per-call fallback.
+- **More than a kernel** — scheduled tau with graph preview, dense-step and dense-block gates, conditioning exact-KV sink, feed-forward chunking (−37% MLP peak), int8 q/k and P·V quantization, SM86–SM121 support, and honest per-call fallback.
 
 ## Features
 
 - **Opt-in per-model patching** — only the model you wire through a node is affected; the rest of your graph is untouched.
 - **Two Sol-Attn integration paths** — a generic hook-based node for any model, and a MiniMax H3 node that feeds the kernel strided views of the fused qkv projection with zero q/k/v copies, plus an exact-KV sink for H3's packed conditioning rows.
-- **SM89 through SM121** — pointer kernels on SM89 and SM120; TMA descriptor kernels on SM90, SM100, and SM121. SM121 covers the DGX Spark.
+- **SM86 through SM121** — pointer kernels on SM86, SM89, and SM120; TMA descriptor kernels on SM90, SM100, and SM121. SM121 covers the DGX Spark.
 - **Scheduled sparsity** — ramp `tau` across sampling (sparse early, dense late) with a plotted schedule preview.
 - **Bit-exact H3 modulation fusion** — combines segmented AdaLN and gated residual elementwise work without changing eager BF16 output or the selected attention backend.
 - **Feed-forward chunking** — caps MiniMax H3's MLP peak activation memory, bit-identical output.
@@ -61,7 +61,7 @@ Measured on an RTX 5090 (current local release matrix in [BENCHMARKS.md](BENCHMA
 
 ## Prerequisites
 
-- NVIDIA GPU: **SM89, SM90, SM100, SM120, or SM121** — SM89/SM120 run the pointer forward kernels; SM90/100/121 run TMA. Only SM120 is tested on hardware by this repository; SM121 (DGX Spark) is enabled by PR #3 and remains on its existing TMA path; SM89 is validated by forced dispatch, not on an SM89 GPU.
+- NVIDIA GPU: **SM86, SM89, SM90, SM100, SM120, or SM121** — SM86/89/120 run the pointer forward kernels; SM90/100/121 run TMA. SM120 is tested and benchmarked locally; SM86 is community hardware smoke-tested on an RTX 3090ti, SM89 is community hardware smoke-tested on an RTX 4080 SUPER ([issue #2](https://github.com/Saganaki22/ComfyUI-sol-attn/issues/2)); and SM121 (DGX Spark) is community-tested. SM86/SM89 performance is not yet benchmarked here.
 - PyTorch with CUDA, **bfloat16** support
 - **Triton** with `triton.tools.tensor_descriptor` (TMA) — verified on 3.6.0
 - ComfyUI (developed against 0.30.0)
@@ -299,7 +299,7 @@ On the environment under "Tested on":
 - Strided-view kernel output is **bit-identical** to contiguous input (max abs diff 0), including at ragged sequence lengths (8,191 / 12,345 / 38,247 tokens).
 - All-exact mode (`tau=-100`, validation only) matches PyTorch SDPA at relative L2 error `0.00097`.
 - The full patched H3 attention module matches the stock forward at relative L2 error `0.00009`, consistent with bf16 accumulation differences.
-- The SM89/SM120 pointer kernel twins are bit-identical to the TMA kernels (bf16 and int8_qk); sink-forced-exact mode matches dense output.
+- The shared SM86/SM89/SM120 pointer implementation is bit-identical to the TMA kernels when cross-checked by forced dispatch on SM120 (bf16 and int8_qk); sink-forced-exact mode matches dense output.
 - Inline-Q residual-int8 matches the former materialized-Q path bit-for-bit for aligned/ragged lengths, conditioning sinks, dense query rows, and `int8_pv` on/off.
 - Fused H3 modulation/gating matches eager BF16 output bit-for-bit with both BF16 and FP32 AdaLN tables, including a real ComfyUI `DiTBlock` integration test.
 - Chunked ×2 MLP output matches the full MLP exactly (`assert_close`, rtol=atol=0).
@@ -330,7 +330,7 @@ Each distinct fallback reason is logged once per run. Also note the compile tax:
 - **MiniMax H3 is not evaluated in the Sol-Attn paper.** H3 uses a joint packed sequence (text, conditioning, audio, video); the `sink_conditioning` option implements the paper's exact conditioning-K/V handling, but dense first-layer scheduling and the rest of the paper's more conservative recipe are not implemented.
 - **The native-Windows SM120 pointer path and SM121 enablement are repository integrations.** NVIDIA's current Sol-Engine branch has an optional Linux CuTe backend for SM120 and a portable Triton fallback; this package retains its own Comfy-compatible strided, residual-int8 implementation. SM121 (DGX Spark) support originated in community PR #3.
 - **The H3-specific nodes bypass ComfyUI's attention hook.** Other patches attached to `optimized_attention_override` do not run on blocks where Sol is active, and attention `transformer_options` patches are not applied on the Sol path.
-- **Architecture paths are intentionally separate.** SM120 now uses the faster pointer forward validated on RTX 5090, while SM121 retains its existing TMA path and is not hardware-tested by this repository. SM89 uses the same pointer family but is validated only by forced dispatch on SM120. SM90/100 remain TMA. Run with `strict=true` once on a new environment.
+- **Architecture paths are intentionally separate.** SM86, SM89, and SM120 use the pointer family; SM120 is validated and benchmarked on RTX 5090, while SM86 and SM89 are hardware smoke-tested on RTX 30- and RTX 40-series respectively but are not yet performance-benchmarked here. The shared SM86/SM89/SM120 implementation is additionally cross-checked by forced dispatch on SM120. SM90/100/121 remain TMA. Run with `strict=true` once on a new environment.
 - NVIDIA's published ~2.0–2.3× figures are for Sol-Engine as a whole (CuTe kernels, NVFP4, block fusion, datacenter GPUs). This is the Triton reference kernel alone — a different thing entirely.
 - The [KingGore Blackwell fork](https://github.com/KingGore/ComfyUI_sol-attn_Blackwell) was evaluated at H3 width: 4.334 ms for its `flex_attention` path vs 3.256 ms for this Triton reference at 8,192 tokens. It uses a hard block mask (unselected blocks are dropped, not approximated), so it is a different method, and its import-time repair that moves files inside the installed PyTorch package is intentionally excluded here.
 

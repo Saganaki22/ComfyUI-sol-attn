@@ -66,9 +66,10 @@ def _tma_compatible(t):
 def _validate(q, k, v, kv_splits, thresh_type):
     """Validate the explicit architecture set supported by this integration.
 
-    SM120 is tested locally on its pointer path. SM89 uses the same pointer
-    family but is validated by forced dispatch, not on SM89 hardware. SM121
-    retains the community-enabled TMA path. Other architectures remain
+    SM120 is tested locally on its pointer path. SM86 is community-tested on RTX 30
+    hardware, and SM89 is community-tested on RTX 40 hardware; the shared
+    SM86/SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
+    SM121 retains the community-enabled TMA path. Other architectures remain
     disabled instead of being treated as implicitly compatible.
     """
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
@@ -89,8 +90,8 @@ def _validate(q, k, v, kv_splits, thresh_type):
     if kv_splits > route_groups:
         raise ValueError("each KV split must contain at least one N64 route group")
     arch = torch.cuda.get_device_capability(q.device)
-    if arch not in ((9, 0), (10, 0), (12, 0), (12, 1), (8, 9)):
-        raise RuntimeError("Sol-Attn supports SM89, SM90, SM100, SM120, SM121")
+    if arch not in ((8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)):
+        raise RuntimeError("Sol-Attn supports SM86, SM89, SM90, SM100, SM120, SM121")
     return arch
 
 
@@ -104,7 +105,7 @@ _POINTER_INLINE_Q = True
 
 def _use_pointer_arch(arch):
     """Architectures where the pointer forward wins or TMA is unavailable."""
-    return arch in ((8, 9), (12, 0))
+    return arch in ((8, 6), (8, 9), (12, 0))
 
 
 @_tuned(_TMA_CONFIGS)
@@ -433,7 +434,7 @@ def _forward_ptr(
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
-    """Pointer twin of _forward for pre-TMA arches (SM89). Masked loads with
+    """Pointer twin of _forward for pre-TMA arches (SM86/SM89). Masked loads with
     explicit strides; q/k/v keep their layout, so interleaved qkv views need
     no contiguous() copy."""
     v_tile, q_block, batch_head = (
@@ -573,7 +574,7 @@ def _forward_int8_ptr(
     INT8_PV: tl.constexpr,
     INLINE_Q: tl.constexpr,
 ):
-    """Pointer INT8 forward for SM89 and SM120.
+    """Pointer INT8 forward for SM86, SM89, and SM120.
 
     With INLINE_Q, per-token Q quantization and the diagonal route threshold
     are derived from the BF16 Q tile already resident in this program. This
@@ -777,7 +778,7 @@ def sol_attn(
     sinks = (int(sink_blocks[0]), int(sink_blocks[1]), int(sink_q[0]), int(sink_q[1]))
 
     if _use_pointer_arch(arch):
-        # SM89/SM120 pointer path: masked loads, q/k/v keep their strides.
+        # SM86/SM89/SM120 pointer path: masked loads, q/k/v keep their strides.
         if int8_qk:
             # Below the node's normal 4K Sol gate, the separate producer is
             # already tiny and can autotune to a different forward warp count;

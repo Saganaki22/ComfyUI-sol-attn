@@ -1,8 +1,9 @@
 """Sol-Attn (NVIDIA Sana / Sol-Engine) as an opt-in ComfyUI attention backend.
 
 Uses NVIDIA's Triton reference kernel on the explicit architecture set this
-package supports: SM89, SM90, SM100, SM120, and SM121. SM120 is hardware-tested
-locally; SM89 is forced-dispatch validated and SM121 is community-tested.
+package supports: SM86, SM89, SM90, SM100, SM120, and SM121. SM120 is
+hardware-tested locally; SM86, SM89, and SM121 are user-tested. The shared
+SM86/SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
 
 Hard requirements of the kernel (anything else falls back to your normal
 backend, e.g. SageAttention):
@@ -23,7 +24,7 @@ from .sol_kernel import sol_attn
 log = logging.getLogger(__name__)
 
 BLOCK = 64
-SUPPORTED_ARCHES = {(8, 9), (9, 0), (10, 0), (12, 0), (12, 1)}
+SUPPORTED_ARCHES = {(8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)}
 
 
 class _Unsupported(Exception):
