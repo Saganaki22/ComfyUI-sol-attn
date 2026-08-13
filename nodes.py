@@ -3,7 +3,7 @@
 Uses NVIDIA's Triton reference kernel on the explicit architecture set this
 package supports: SM86, SM89, SM90, SM100, SM120, and SM121. SM120 is
 hardware-tested locally; SM86, SM89, and SM121 are user-tested. The shared
-SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
+SM86/SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
 
 Hard requirements of the kernel (anything else falls back to your normal
 backend, e.g. SageAttention):

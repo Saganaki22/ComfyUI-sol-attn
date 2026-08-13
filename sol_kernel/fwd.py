@@ -68,7 +68,7 @@ def _validate(q, k, v, kv_splits, thresh_type):
 
     SM120 is tested locally on its pointer path. SM86 is community-tested on RTX 30
     hardware, and SM89 is community-tested on RTX 40 hardware; the shared
-    SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
+    SM86/SM89/SM120 pointer implementation is also cross-checked by forced dispatch.
     SM121 retains the community-enabled TMA path. Other architectures remain
     disabled instead of being treated as implicitly compatible.
     """
